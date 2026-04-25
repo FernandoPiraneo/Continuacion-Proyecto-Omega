@@ -23,9 +23,11 @@ from app.timeframe import normalize_timeframe
 from app.trade_manager import TradeManager
 from app.geometric_core import analyze_geometry
 
+
 def _is_geometry_enabled() -> bool:
     val = os.environ.get("ENABLE_GEOMETRY_CORE", "false").strip().lower()
     return val in {"1", "true", "yes", "on"}
+
 
 def _serialize_geometry(geom_analysis) -> dict:
     if not geom_analysis:
@@ -33,6 +35,17 @@ def _serialize_geometry(geom_analysis) -> dict:
     return {
         "bias": geom_analysis.bias,
         "confidence_score": geom_analysis.confidence_score,
+        "reason": geom_analysis.reason,
+        "zones": [
+            {
+                "kind": zone.kind,
+                "low": zone.low,
+                "high": zone.high,
+                "touches": zone.touches,
+                "confidence_score": zone.confidence_score,
+            }
+            for zone in geom_analysis.zones
+        ],
         "patterns": [
             {
                 "type": p.pattern_type,
@@ -50,6 +63,7 @@ DispatchAlerts = Callable[[list[AlertEvent]], Awaitable[int]]
 SignalSentCallback = Callable[[AlertEvent], Awaitable[None]]
 
 QUALITY_ORDER = {"BAJA": 1, "MEDIA": 2, "ALTA": 3, "MUY_ALTA": 4}
+QUALITY_LABELS = ("BAJA", "MEDIA", "ALTA", "MUY_ALTA")
 DEFAULT_ALLOWED_SIGNAL_TYPES = {
     "LONG_PULLBACK",
     "SHORT_PULLBACK",
@@ -58,6 +72,130 @@ DEFAULT_ALLOWED_SIGNAL_TYPES = {
     "LONG_REVERSAL_EARLY",
     "SHORT_REVERSAL_EARLY",
 }
+GEOMETRY_WEIGHT_MAX = 70.0
+INDICATOR_WEIGHT_MAX = 30.0
+MIN_GEOMETRY_FOR_HIGH = 45.0
+MIN_GEOMETRY_FOR_VERY_HIGH = 55.0
+MIN_GEOMETRY_FOR_ALERT = 30.0
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _cap_quality(current: str, maximum: str) -> str:
+    curr_idx = QUALITY_LABELS.index(current) if current in QUALITY_LABELS else 0
+    max_idx = QUALITY_LABELS.index(maximum) if maximum in QUALITY_LABELS else 0
+    return QUALITY_LABELS[min(curr_idx, max_idx)]
+
+
+def _quality_from_total_score(total_score: float) -> str:
+    if total_score >= 85:
+        return "MUY_ALTA"
+    if total_score >= 70:
+        return "ALTA"
+    if total_score >= 55:
+        return "MEDIA"
+    return "BAJA"
+
+
+def _has_confirmed_geometry_pattern(geometry_m15: dict | None, direction: str) -> bool:
+    if not isinstance(geometry_m15, dict):
+        return False
+    expected_bias = "LONG" if direction == "LONG" else "SHORT"
+    for pattern in geometry_m15.get("patterns", []):
+        if not isinstance(pattern, dict):
+            continue
+        pattern_type = str(pattern.get("type", ""))
+        pattern_bias = str(pattern.get("bias", "NEUTRAL")).upper()
+        score = float(pattern.get("score", 0.0) or 0.0)
+        if pattern_type.startswith("POTENTIAL_"):
+            continue
+        if pattern_bias not in {expected_bias, "NEUTRAL"}:
+            continue
+        if score >= 65:
+            return True
+    return False
+
+
+def _calculate_indicator_score(quality_payload: dict[str, object], direction: str) -> float:
+    score = 0.0
+    expected_bias = "BULL" if direction == "LONG" else "BEAR"
+    opposite_bias = "BEAR" if direction == "LONG" else "BULL"
+
+    # EMA / tendencia (max 7)
+    ema_score = 0.0
+    ema_human = quality_payload.get("ema_human", {})
+    if isinstance(ema_human, dict):
+        close_vs = str(ema_human.get("close_vs_ema200", "")).upper()
+        ema55_vs = str(ema_human.get("ema55_vs_ema200", "")).upper()
+        if close_vs == "ABOVE" and ema55_vs == "ABOVE" and expected_bias == "BULL":
+            ema_score = 7.0
+        elif close_vs == "BELOW" and ema55_vs == "BELOW" and expected_bias == "BEAR":
+            ema_score = 7.0
+        elif close_vs in {"ABOVE", "BELOW"} and ema55_vs in {"ABOVE", "BELOW"}:
+            ema_score = 3.0
+    score += min(7.0, ema_score)
+
+    # ADX/DMI (max 7)
+    adx_score = 0.0
+    adx_human = quality_payload.get("adx_human", {})
+    if isinstance(adx_human, dict):
+        adx_state = str(adx_human.get("state", ""))
+        if adx_state in {"ADX_FAVOR_STRONG", "ADX_EXTENDED"}:
+            adx_score = 7.0
+        elif adx_state == "ADX_FAVOR_OK":
+            adx_score = 5.0
+        elif adx_state == "ADX_WEAK":
+            adx_score = 1.0
+    score += min(7.0, adx_score)
+
+    # Squeeze (max 6)
+    sqz_score = 0.0
+    sqz_human = quality_payload.get("sqzmom_human", {})
+    if isinstance(sqz_human, dict):
+        sqz_state = str(sqz_human.get("state", "NEUTRAL")).upper()
+        if (direction == "LONG" and "LONG" in sqz_state) or (direction == "SHORT" and "SHORT" in sqz_state):
+            sqz_score = 6.0 if "STRONG" in sqz_state else 4.0
+        elif "NEUTRAL" in sqz_state:
+            sqz_score = 2.0
+    score += min(6.0, sqz_score)
+
+    # MACD (max 5)
+    macd_score = 0.0
+    macd_human = quality_payload.get("macd_human", {})
+    if isinstance(macd_human, dict):
+        macd_state = str(macd_human.get("state", "NEUTRAL")).upper()
+        if (direction == "LONG" and "LONG" in macd_state) or (direction == "SHORT" and "SHORT" in macd_state):
+            macd_score = 5.0 if "STRONG" in macd_state else 3.0
+        elif "NEUTRAL" in macd_state:
+            macd_score = 1.0
+    score += min(5.0, macd_score)
+
+    # Flujo/Koncorde (max 5)
+    kon_score = 0.0
+    kon_human = quality_payload.get("koncorde_human", {})
+    if isinstance(kon_human, dict):
+        kon_state = str(kon_human.get("state", "NEUTRAL")).upper()
+        if (direction == "LONG" and kon_state in {"LONG_STRONG", "LONG_OK"}) or (
+            direction == "SHORT" and kon_state in {"SHORT_STRONG", "SHORT_OK"}
+        ):
+            kon_score = 5.0 if kon_state.endswith("STRONG") else 3.0
+        elif kon_state in {"NEUTRAL", "ABSORPTION"}:
+            kon_score = 1.0
+        elif kon_state in {"CONTRARY", "DRY_VOLUME"}:
+            kon_score = 0.0
+    score += min(5.0, kon_score)
+
+    # si los dos filtros más importantes están contrarios, recorte suave
+    if isinstance(adx_human, dict) and isinstance(kon_human, dict):
+        if bool(adx_human.get("is_contrary", False)) or bool(kon_human.get("is_contrary", False)):
+            score -= 3.0
+        if bool(adx_human.get("is_weak", False)) and str(kon_human.get("state", "")).upper() == "DRY_VOLUME":
+            score -= 2.0
+
+    return _clamp(score, 0.0, INDICATOR_WEIGHT_MAX)
+
 
 
 def evaluate_auto_alert_gate(
@@ -396,6 +534,77 @@ class SignalScanner:
     def get_last_scan_state(self) -> dict[str, dict[str, object]]:
         return dict(self._last_scan_state)
 
+    def _apply_geometry_weighted_scoring(
+        self,
+        *,
+        quality: dict[str, object],
+        geometry_m15: dict | None,
+        direction: str,
+    ) -> dict[str, object]:
+        scored = dict(quality)
+
+        geometry_confidence = 0.0
+        geometry_bias = "NEUTRAL"
+        geometry_reason = "sin geometría M15"
+        if isinstance(geometry_m15, dict):
+            geometry_confidence = float(geometry_m15.get("confidence_score", 0.0) or 0.0)
+            geometry_bias = str(geometry_m15.get("bias", "NEUTRAL")).upper()
+            geometry_reason = str(geometry_m15.get("reason", "sin razón geométrica"))
+
+        geometry_score = _clamp(geometry_confidence * 0.70, 0.0, GEOMETRY_WEIGHT_MAX)
+        indicator_score = _calculate_indicator_score(scored, direction)
+        total_score = _clamp(geometry_score + indicator_score, 0.0, 100.0)
+
+        quality_label = _quality_from_total_score(total_score)
+        degraders = list(scored.get("degraders", [])) if isinstance(scored.get("degraders"), list) else []
+        blockers = list(scored.get("blockers", [])) if isinstance(scored.get("blockers"), list) else []
+
+        expected_geom_bias = "BULLISH" if direction == "LONG" else "BEARISH"
+        opposite_geom_bias = "BEARISH" if direction == "LONG" else "BULLISH"
+        confirmed_pattern = _has_confirmed_geometry_pattern(geometry_m15, direction)
+
+        if geometry_score < MIN_GEOMETRY_FOR_ALERT:
+            quality_label = _cap_quality(quality_label, "BAJA")
+            degraders.append("geometría débil (<30/70)")
+        elif geometry_score < MIN_GEOMETRY_FOR_HIGH:
+            quality_label = _cap_quality(quality_label, "MEDIA")
+            degraders.append("geometría insuficiente para ALTA (<45/70)")
+        elif geometry_score < MIN_GEOMETRY_FOR_VERY_HIGH:
+            quality_label = _cap_quality(quality_label, "ALTA")
+
+        if geometry_bias == opposite_geom_bias:
+            quality_label = _cap_quality(quality_label, "BAJA")
+            blockers.append("M15 geométrico contrario a la señal")
+            scored["signal_type"] = "CONFLICT"
+        elif geometry_bias == "NEUTRAL" and not confirmed_pattern:
+            quality_label = _cap_quality(quality_label, "MEDIA")
+            degraders.append("M15 geométrico neutral")
+
+        if geometry_score < MIN_GEOMETRY_FOR_ALERT:
+            scored["alert_allowed"] = False
+            if str(scored.get("signal_type", "")) not in {"SIN_SEÑAL", "CONFLICT"}:
+                scored["signal_type"] = "CONFLICT"
+            blockers.append("geometría M15 no armada para alerta fuerte")
+        else:
+            scored["alert_allowed"] = bool(scored.get("alert_allowed", False)) and "M15 geométrico contrario a la señal" not in blockers
+
+        scored["quality"] = quality_label
+        scored["final_quality"] = quality_label
+        scored["raw_quality"] = quality_label
+        scored["score"] = int(round(total_score))
+        scored["score_total"] = int(round(total_score))
+        scored["geometry_score"] = round(geometry_score, 2)
+        scored["indicator_score"] = round(indicator_score, 2)
+        scored["total_score"] = round(total_score, 2)
+        scored["geometry_bias_m15"] = geometry_bias
+        scored["geometry_reason_m15"] = geometry_reason
+        scored["geometry_confirmed_pattern"] = confirmed_pattern
+        scored["blockers"] = sorted(set(str(item) for item in blockers if str(item).strip()))
+        scored["degraders"] = sorted(set(str(item) for item in degraders if str(item).strip()))
+        if scored["blockers"]:
+            scored["no_signal_reason"] = "; ".join(scored["blockers"])
+        return scored
+
     async def _scan_symbol(self, symbol: str) -> list[ScannerSignal]:
         candles_by_tf: dict[str, list[Candle]] = {}
         tf_directions: dict[str, str] = {}
@@ -493,6 +702,16 @@ class SignalScanner:
             structure_by_tf=structure_by_tf if self._structure_enabled else None,
         )
 
+        result = str(quality.get("result", "SIN_SEÑAL"))
+        if result not in {"LONG", "SHORT"}:
+            return []
+
+        quality = self._apply_geometry_weighted_scoring(
+            quality=quality,
+            geometry_m15=geometry_m15,
+            direction=result,
+        )
+
         if not bool(quality.get("alert_allowed", False)):
             self._logger.info(
                 "Scanner bloqueado %s | signal_type=%s blockers=%s degraders=%s score=%s reason=%s",
@@ -500,15 +719,12 @@ class SignalScanner:
                 quality.get("signal_type", "SIN_SEÑAL"),
                 quality.get("blockers", []),
                 quality.get("degraders", []),
-                quality.get("score_total", quality.get("score", 0)),
+                quality.get("total_score", quality.get("score_total", quality.get("score", 0))),
                 quality.get("no_signal_reason", ""),
             )
             return []
 
-        result = str(quality["result"])
         signals: list[ScannerSignal] = []
-        if result not in {"LONG", "SHORT"}:
-            return []
 
         full_sync = tf_directions["1m"] == result
         m15_closed = self._last_closed_candle(candles_by_tf["15m"])
@@ -650,8 +866,39 @@ class SignalScanner:
         elif m15_ema["cross"] == "bear_cross":
             cross_text = "🔴 bear"
         expected_bias = "BULL" if direction == "LONG" else "BEAR"
+        expected_geometry_bias = "BULLISH" if direction == "LONG" else "BEARISH"
 
         effective_quality = effective_quality_label(quality_payload=quality, structure_m15=structure_m15)
+        geometry_score = float(quality.get("geometry_score", 0.0) or 0.0)
+        indicator_score = float(quality.get("indicator_score", 0.0) or 0.0)
+        total_score = float(quality.get("total_score", quality.get("score_total", quality.get("score", 0.0))) or 0.0)
+        geometry_bias = str(quality.get("geometry_bias_m15", geometry_m15.get("bias", "NEUTRAL") if isinstance(geometry_m15, dict) else "NEUTRAL")).upper()
+        geometry_reason = str(quality.get("geometry_reason_m15", geometry_m15.get("reason", "") if isinstance(geometry_m15, dict) else "sin geometría M15"))
+        geometry_patterns = geometry_m15.get("patterns", []) if isinstance(geometry_m15, dict) else []
+        confirmed_patterns = [
+            str(p.get("type", "UNKNOWN"))
+            for p in geometry_patterns
+            if isinstance(p, dict) and not str(p.get("type", "")).startswith("POTENTIAL_")
+        ]
+        potential_patterns = [
+            str(p.get("type", "UNKNOWN"))
+            for p in geometry_patterns
+            if isinstance(p, dict) and str(p.get("type", "")).startswith("POTENTIAL_")
+        ]
+        dominant_zone = None
+        if isinstance(geometry_m15, dict):
+            zones = geometry_m15.get("zones", [])
+            if isinstance(zones, list) and zones:
+                zone0 = zones[0]
+                if isinstance(zone0, dict):
+                    try:
+                        dominant_zone = (
+                            f"{zone0.get('kind', 'N/A')} "
+                            f"{float(zone0.get('low', 0.0)):.4f}-{float(zone0.get('high', 0.0)):.4f}"
+                        )
+                    except (TypeError, ValueError):
+                        dominant_zone = str(zone0.get("kind", "N/A"))
+
         note = "\n".join(
             [
                 "⚠️ Señal detectada",
@@ -669,6 +916,17 @@ class SignalScanner:
                 f"- MAs: {header_icon} {m15_ema['relation']} | cruce {cross_text}",
                 f"- ADX: {quality.get('adx_human', {}).get('status', '🟡 sin lectura')}",
                 f"- Flujo: {quality.get('koncorde_human', {}).get('status', '🟡 flujo neutral')}",
+                "",
+                f"📐 Geometría: {geometry_score:.1f}/70",
+                f"- M15: {geometry_bias}",
+                f"- Sesgo esperado: {expected_geometry_bias}",
+                f"- Razón: {geometry_reason}",
+                f"- Patrón confirmado: {confirmed_patterns[0] if confirmed_patterns else 'none'}",
+                f"- Patrón potencial: {potential_patterns[0] if potential_patterns else 'none'}",
+                f"- Zona dominante: {dominant_zone or 'none'}",
+                "",
+                f"📊 Indicadores: {indicator_score:.1f}/30",
+                f"🎯 Score total: {total_score:.1f}/100",
                 "",
                 "⚠ Solo alerta. No orden.",
             ]
@@ -699,6 +957,11 @@ class SignalScanner:
                 "quality_payload": quality,
                 "structure_m15": structure_m15,
                 "geometry_m15": geometry_m15,
+                "geometry_score": geometry_score,
+                "indicator_score": indicator_score,
+                "total_score": total_score,
+                "m15_geometry_bias": geometry_bias,
+                "m15_geometry_reason": geometry_reason,
                 "severity": self._severity_from_quality(quality_label, level).value,
             },
         )

@@ -14,6 +14,13 @@ class TelegramNotificationError(RuntimeError):
 
 
 class TelegramNotifier:
+    PRIORITY_ICON = {
+        AlertPriority.INFO: "ℹ️",
+        AlertPriority.WARNING: "⚠️",
+        AlertPriority.ERROR: "❌",
+        AlertPriority.CRITICAL: "🚨",
+    }
+
     def __init__(
         self,
         bot_token: str,
@@ -161,7 +168,8 @@ class TelegramNotifier:
                     text = f"{text.rstrip()}\n\n{geom_block}"
             return text
 
-        lines = [f"<b>{html.escape(event.priority.value)} | Trading Alert</b>"]
+        icon = self.PRIORITY_ICON.get(event.priority, "ℹ️")
+        lines = [f"<b>{icon} {html.escape(event.priority.value)} | Trading Alert</b>"]
 
         if event.symbol != "SYSTEM":
             lines.extend(

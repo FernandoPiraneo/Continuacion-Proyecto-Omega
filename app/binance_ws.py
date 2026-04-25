@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
@@ -25,12 +26,20 @@ class BinanceMarketStream:
         *,
         stream_suffix: str,
         reconnect_backoff: list[int],
+        ping_interval: int = 30,
+        ping_timeout: int = 60,
+        close_timeout: int = 10,
+        max_queue: int = 1024,
         logger: logging.Logger,
     ) -> None:
         self._client = client
         self._symbols = sorted(set(symbol.upper() for symbol in symbols))
         self._stream_suffix = stream_suffix
-        self._reconnect_backoff = reconnect_backoff or [1, 3, 5, 10, 20]
+        self._reconnect_backoff = reconnect_backoff or [1, 2, 5, 10, 30, 60]
+        self._ping_interval = max(1, int(ping_interval))
+        self._ping_timeout = max(1, int(ping_timeout))
+        self._close_timeout = max(1, int(close_timeout))
+        self._max_queue = max(1, int(max_queue))
         self._logger = logger
         self._stop_event = asyncio.Event()
         self._restart_event = asyncio.Event()
@@ -62,9 +71,10 @@ class BinanceMarketStream:
             try:
                 async with websockets.connect(
                     url,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    max_queue=1000,
+                    ping_interval=self._ping_interval,
+                    ping_timeout=self._ping_timeout,
+                    close_timeout=self._close_timeout,
+                    max_queue=self._max_queue,
                 ) as websocket:
                     self._logger.info("Market stream conectado para %s", ", ".join(self._symbols))
                     attempt = 0
@@ -82,7 +92,13 @@ class BinanceMarketStream:
 
                         if restart_task in done and self._restart_event.is_set():
                             self._logger.info("Reiniciando market stream por cambio de símbolos.")
-                            await websocket.close()
+                            try:
+                                await asyncio.wait_for(
+                                    websocket.close(),
+                                    timeout=self._close_timeout + 1,
+                                )
+                            except asyncio.TimeoutError:
+                                self._logger.warning("Timeout cerrando market websocket durante reinicio.")
                             break
                         if receive_task not in done:
                             continue
@@ -105,11 +121,19 @@ class BinanceMarketStream:
             except (ConnectionClosed, OSError, ValueError) as exc:
                 if self._restart_event.is_set() or self._stop_event.is_set():
                     continue
-                delay = self._reconnect_backoff[min(attempt, len(self._reconnect_backoff) - 1)]
+                attempt_index = min(attempt, len(self._reconnect_backoff) - 1)
+                base_delay = self._reconnect_backoff[attempt_index]
+                jitter_factor = random.uniform(0.8, 1.2)
+                delay = max(1.0, base_delay * jitter_factor)
                 attempt += 1
                 await on_status(
                     "market_ws_disconnected",
-                    {"error": str(exc), "retry_in_seconds": delay},
+                    {
+                        "error": str(exc),
+                        "retry_in_seconds": round(delay, 2),
+                        "attempt": attempt,
+                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    },
                 )
                 await asyncio.sleep(delay)
 

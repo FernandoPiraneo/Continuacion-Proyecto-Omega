@@ -21,6 +21,7 @@ class TradeStatus(StrEnum):
 class AlertPriority(StrEnum):
     INFO = "INFO"
     WARNING = "WARNING"
+    ERROR = "ERROR"
     CRITICAL = "CRITICAL"
 
 
@@ -190,8 +191,12 @@ class BinanceSettings:
     kline_limit: int = 250
     market_stream_suffix: str = "@markPrice@1s"
     user_stream_keepalive_minutes: int = 45
+    ws_ping_interval: int = 30
+    ws_ping_timeout: int = 60
+    ws_close_timeout: int = 10
+    ws_max_queue: int = 1024
     reconnect_backoff_seconds: list[int] = field(
-        default_factory=lambda: [1, 3, 5, 10, 20]
+        default_factory=lambda: [1, 2, 5, 10, 30, 60]
     )
 
 

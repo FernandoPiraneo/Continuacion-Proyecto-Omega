@@ -576,21 +576,36 @@ class TelegramCommandBot:
 
     async def _handle_status(self, chat_id: str, _: str) -> None:
         status = self._status_provider()
+        lines = [
+            "Estado del bot:",
+            f"DRY_RUN={status['DRY_RUN']}",
+            f"BINANCE_TESTNET={status['BINANCE_TESTNET']}",
+            f"BINANCE_PRIVATE_ACCOUNT_SYNC={status['BINANCE_PRIVATE_ACCOUNT_SYNC']}",
+            f"BINANCE_MARKET_SOURCE={status['BINANCE_MARKET_SOURCE']}",
+            f"SCANNER_ENABLED={status.get('SCANNER_ENABLED', 'false')}",
+            f"SCANNER_ALERTS_ENABLED={status.get('SCANNER_ALERTS_ENABLED', 'false')}",
+            f"SCANNER_INTERVAL_SECONDS={status.get('SCANNER_INTERVAL_SECONDS', 60)}",
+            f"Trades activos={status['active_trades']}",
+        ]
+        if "MARKET_WS_STATE" in status:
+            lines.extend(
+                [
+                    "",
+                    "📡 Market WS",
+                    f"Estado={status.get('MARKET_WS_STATE', 'N/A')}",
+                    f"Último dato hace={status.get('MARKET_WS_SECONDS_SINCE_LAST_MESSAGE', 'N/A')}s",
+                    f"Reconexiones={status.get('MARKET_WS_RECONNECT_COUNT', 0)}",
+                    f"Fallos consecutivos={status.get('MARKET_WS_CONSECUTIVE_FAILURES', 0)}",
+                    f"Uptime WS={status.get('MARKET_WS_UPTIME_SECONDS', 'N/A')}s",
+                    f"Último error={status.get('MARKET_WS_LAST_ERROR', 'none')}",
+                    f"Retry (último/próximo)={status.get('MARKET_WS_LAST_RETRY_SECONDS', 'n/a')}s",
+                ]
+            )
+        if "EVENT_LOOP_LAG_MS" in status:
+            lines.append(f"Lag loop={status.get('EVENT_LOOP_LAG_MS', 0)}ms")
         await self._send_message(
             chat_id,
-            "\n".join(
-                [
-                    "Estado del bot:",
-                    f"DRY_RUN={status['DRY_RUN']}",
-                    f"BINANCE_TESTNET={status['BINANCE_TESTNET']}",
-                    f"BINANCE_PRIVATE_ACCOUNT_SYNC={status['BINANCE_PRIVATE_ACCOUNT_SYNC']}",
-                    f"BINANCE_MARKET_SOURCE={status['BINANCE_MARKET_SOURCE']}",
-                    f"SCANNER_ENABLED={status.get('SCANNER_ENABLED', 'false')}",
-                    f"SCANNER_ALERTS_ENABLED={status.get('SCANNER_ALERTS_ENABLED', 'false')}",
-                    f"SCANNER_INTERVAL_SECONDS={status.get('SCANNER_INTERVAL_SECONDS', 60)}",
-                    f"Trades activos={status['active_trades']}",
-                ]
-            ),
+            "\n".join(lines),
         )
 
     async def _handle_trades(self, chat_id: str, _: str) -> None:

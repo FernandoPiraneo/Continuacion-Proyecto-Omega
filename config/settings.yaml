@@ -9,7 +9,11 @@ binance:
   kline_limit: 250
   market_stream_suffix: "@markPrice@1s"
   user_stream_keepalive_minutes: 45
-  reconnect_backoff_seconds: [1, 3, 5, 10, 20]
+  reconnect_backoff_seconds: [1, 2, 5, 10, 30, 60]
+  ws_ping_interval: 30
+  ws_ping_timeout: 60
+  ws_close_timeout: 10
+  ws_max_queue: 1024
 
 alerts:
   stop_loss_warning_pct: 0.35

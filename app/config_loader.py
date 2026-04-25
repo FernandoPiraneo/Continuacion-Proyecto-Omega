@@ -88,10 +88,26 @@ def load_settings(path: Path) -> AppSettings:
                 binance_raw.get("user_stream_keepalive_minutes", 45),
                 "binance.user_stream_keepalive_minutes",
             ),
+            ws_ping_interval=_as_int(
+                binance_raw.get("ws_ping_interval", 30),
+                "binance.ws_ping_interval",
+            ),
+            ws_ping_timeout=_as_int(
+                binance_raw.get("ws_ping_timeout", 60),
+                "binance.ws_ping_timeout",
+            ),
+            ws_close_timeout=_as_int(
+                binance_raw.get("ws_close_timeout", 10),
+                "binance.ws_close_timeout",
+            ),
+            ws_max_queue=_as_int(
+                binance_raw.get("ws_max_queue", 1024),
+                "binance.ws_max_queue",
+            ),
             reconnect_backoff_seconds=[
                 _as_int(value, "binance.reconnect_backoff_seconds")
                 for value in binance_raw.get(
-                    "reconnect_backoff_seconds", [1, 3, 5, 10, 20]
+                    "reconnect_backoff_seconds", [1, 2, 5, 10, 30, 60]
                 )
             ],
         ),

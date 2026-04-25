@@ -15,6 +15,7 @@ from app.binance_client import BinanceAPIError, BinanceFuturesClient
 from app.binance_ws import BinanceMarketStream, BinanceUserDataStream
 from app.config_loader import ConfigError, load_settings, load_trades
 from app.logger import configure_logging
+from app.market_ws_supervisor import MarketWebSocketSupervisor
 from app.models import AlertPriority, PriceUpdate, TradeConfig, TradeStatus
 from app.scanner import SignalScanner
 from app.storage import Storage
@@ -67,6 +68,7 @@ class TradingAlertBot:
         self.telegram: TelegramNotifier | None = None
         self.command_bot: TelegramCommandBot | None = None
         self.market_stream: BinanceMarketStream | None = None
+        self.ws_supervisor: MarketWebSocketSupervisor | None = None
         self.user_stream: BinanceUserDataStream | None = None
         self.scanner: SignalScanner | None = None
         self.tasks: list[asyncio.Task] = []
@@ -109,10 +111,13 @@ class TradingAlertBot:
         self.armed_m15_ttl_candles = 2
         self.armed_m15_tf_seconds = 15 * 60
         self._plan_create_locks: dict[str, asyncio.Lock] = {}
+        self.last_event_loop_lag_ms = 0.0
+        self.event_loop_lag_error_streak = 0
+        self._last_event_loop_lag_warning_log_at = 0.0
 
-    def _runtime_status(self) -> dict[str, str | int]:
+    def _runtime_status(self) -> dict[str, object]:
         assert self.trade_manager is not None
-        return {
+        status: dict[str, str | int | float] = {
             "DRY_RUN": str(self.dry_run).lower(),
             "BINANCE_TESTNET": str(self.binance_testnet).lower(),
             "BINANCE_PRIVATE_ACCOUNT_SYNC": str(self.binance_private_account_sync).lower(),
@@ -122,7 +127,25 @@ class TradingAlertBot:
             "SCANNER_ALERTS_ENABLED": str(self.scanner_alerts_enabled).lower(),
             "SCANNER_INTERVAL_SECONDS": self.scanner_interval_seconds,
             "ENABLE_GEOMETRY_CORE": os.getenv("ENABLE_GEOMETRY_CORE", "false").strip().lower() in {"1", "true", "yes", "on"},
+            "EVENT_LOOP_LAG_MS": round(self.last_event_loop_lag_ms, 1),
         }
+        if self.ws_supervisor is not None:
+            ws_status = self.ws_supervisor.get_status()
+            status.update(
+                {
+                    "MARKET_WS_STATE": str(ws_status.get("current_state", "N/A")),
+                    "MARKET_WS_SECONDS_SINCE_LAST_MESSAGE": round(
+                        float(ws_status.get("seconds_since_last_message") or 0.0),
+                        1,
+                    ),
+                    "MARKET_WS_RECONNECT_COUNT": int(ws_status.get("reconnect_count", 0) or 0),
+                    "MARKET_WS_CONSECUTIVE_FAILURES": int(ws_status.get("consecutive_failures", 0) or 0),
+                    "MARKET_WS_UPTIME_SECONDS": round(float(ws_status.get("uptime_seconds") or 0.0), 1),
+                    "MARKET_WS_LAST_ERROR": str(ws_status.get("last_error") or "none"),
+                    "MARKET_WS_LAST_RETRY_SECONDS": ws_status.get("last_retry_in_seconds") or "n/a",
+                }
+            )
+        return status
 
     def _scanner_state(self) -> dict[str, dict[str, object]]:
         if self.scanner is None:
@@ -307,7 +330,9 @@ class TradingAlertBot:
             await self.scanner.stop()
         for task in self.tasks:
             task.cancel()
-        if self.market_stream:
+        if self.ws_supervisor:
+            await self.ws_supervisor.stop()
+        elif self.market_stream:
             await self.market_stream.stop()
         if self.user_stream:
             await self.user_stream.stop()
@@ -423,7 +448,9 @@ class TradingAlertBot:
     async def handle_tradebook_changed(self, symbol: str | None = None) -> None:
         assert self.trade_manager is not None
 
-        if self.market_stream is not None:
+        if self.ws_supervisor is not None:
+            await self.ws_supervisor.update_symbols(self.trade_manager.get_monitored_symbols())
+        elif self.market_stream is not None:
             await self.market_stream.update_symbols(self.trade_manager.get_monitored_symbols())
 
         if symbol:
@@ -518,10 +545,6 @@ class TradingAlertBot:
         assert self.alert_engine is not None
 
         mapping = {
-            "market_ws_disconnected": (
-                AlertPriority.CRITICAL,
-                "WebSocket de mercado desconectado.",
-            ),
             "user_ws_disconnected": (
                 AlertPriority.CRITICAL,
                 "User Data Stream desconectado.",
@@ -543,6 +566,9 @@ class TradingAlertBot:
                 "listenKey expirado.",
             ),
         }
+        if kind not in mapping:
+            self.logger.debug("Stream status no manejado: kind=%s payload=%s", kind, payload)
+            return
         priority, reason = mapping[kind]
         note_parts: list[str] = []
         if "retry_in_seconds" in payload:
@@ -580,12 +606,23 @@ class TradingAlertBot:
             self.trade_manager.get_monitored_symbols(),
             stream_suffix=self.settings.binance.market_stream_suffix,
             reconnect_backoff=self.settings.binance.reconnect_backoff_seconds,
+            ping_interval=_env_int("WS_PING_INTERVAL", self.settings.binance.ws_ping_interval),
+            ping_timeout=_env_int("WS_PING_TIMEOUT", self.settings.binance.ws_ping_timeout),
+            close_timeout=_env_int("WS_CLOSE_TIMEOUT", self.settings.binance.ws_close_timeout),
+            max_queue=_env_int("WS_MAX_QUEUE", self.settings.binance.ws_max_queue),
+            logger=self.logger,
+        )
+        self.ws_supervisor = MarketWebSocketSupervisor(
+            market_stream=self.market_stream,
+            dispatch_alerts=self._dispatch_alerts,
+            alert_engine=self.alert_engine,
             logger=self.logger,
         )
 
         self.tasks = [
-            asyncio.create_task(self.market_stream.run(self.handle_price_update, self.handle_stream_status)),
+            asyncio.create_task(self.ws_supervisor.run(self.handle_price_update, self.handle_stream_status)),
             asyncio.create_task(self._context_refresh_loop()),
+            asyncio.create_task(self._event_loop_lag_monitor()),
             asyncio.create_task(self.command_bot.run_polling()),
         ]
         if self.scanner is not None:
@@ -607,6 +644,32 @@ class TradingAlertBot:
             )
 
         await asyncio.gather(*self.tasks)
+
+    async def _event_loop_lag_monitor(self) -> None:
+        check_interval = 5.0
+        while True:
+            started_at = time.monotonic()
+            await asyncio.sleep(check_interval)
+            lag_ms = max(0.0, ((time.monotonic() - started_at) - check_interval) * 1000)
+            self.last_event_loop_lag_ms = lag_ms
+
+            if lag_ms > 3000:
+                self.event_loop_lag_error_streak += 1
+                if self.event_loop_lag_error_streak == 3:
+                    self.logger.error(
+                        "Event loop lag extremo persistente: %.1fms (streak=%s)",
+                        lag_ms,
+                        self.event_loop_lag_error_streak,
+                    )
+                elif self.event_loop_lag_error_streak < 3:
+                    self.logger.warning("Event loop lag alto: %.1fms", lag_ms)
+            else:
+                self.event_loop_lag_error_streak = 0
+                if lag_ms > 1000:
+                    now = time.monotonic()
+                    if (now - self._last_event_loop_lag_warning_log_at) >= 60:
+                        self.logger.warning("Event loop lag moderado: %.1fms", lag_ms)
+                        self._last_event_loop_lag_warning_log_at = now
 
     async def build_plan_for_signal(
         self,

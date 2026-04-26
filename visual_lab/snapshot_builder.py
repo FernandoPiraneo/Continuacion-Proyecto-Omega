@@ -625,7 +625,52 @@ def _trendline_role(tf: str) -> str:
     return "MICRO_TRIGGER"
 
 
-def build_trendline_overlays(geometry_by_tf: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+TL_LOOKBACK_CANDLES = 30
+_TF_SECONDS = {"15m": 900, "5m": 300, "3m": 180, "1m": 60}
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _line_is_recent_enough(*, tf: str, geometry: dict[str, Any], line: dict[str, Any], lookback_candles: int) -> bool:
+    swings = geometry.get("swing_points")
+    if not isinstance(swings, list) or not swings:
+        return True
+
+    latest_time: int | None = None
+    for point in swings:
+        if not isinstance(point, dict):
+            continue
+        t = _to_int(point.get("time") or point.get("timestamp"))
+        if t is None:
+            continue
+        latest_time = t if latest_time is None else max(latest_time, t)
+
+    if latest_time is None:
+        return True
+
+    line_start = line.get("start") if isinstance(line, dict) else None
+    line_end = line.get("end") if isinstance(line, dict) else None
+    line_anchor_times = [
+        _to_int((point or {}).get("time") if isinstance(point, dict) else None)
+        for point in (line_start, line_end)
+    ]
+    line_anchor_times = [anchor for anchor in line_anchor_times if anchor is not None]
+    if not line_anchor_times:
+        return True
+
+    tf_seconds = _TF_SECONDS.get(tf, 60)
+    min_allowed = latest_time - (max(1, int(lookback_candles)) * tf_seconds)
+    return max(line_anchor_times) >= min_allowed
+
+
+def build_trendline_overlays(geometry_by_tf: dict[str, dict[str, Any]], *, lookback_candles: int = TL_LOOKBACK_CANDLES) -> list[dict[str, Any]]:
     overlays: list[dict[str, Any]] = []
 
     visible_on = {
@@ -643,6 +688,8 @@ def build_trendline_overlays(geometry_by_tf: dict[str, dict[str, Any]]) -> list[
             line = geometry.get(key)
             if not line:
                 continue
+            if not _line_is_recent_enough(tf=tf, geometry=geometry, line=line, lookback_candles=lookback_candles):
+                continue
 
             overlays.append(
                 {
@@ -650,9 +697,10 @@ def build_trendline_overlays(geometry_by_tf: dict[str, dict[str, Any]]) -> list[
                     "source_timeframe": tf,
                     "kind": line.get("kind") or ("SUPPORT" if key == "support_line" else "RESISTANCE"),
                     "role": role,
-                    "label": f"TL {tf.upper()} · {label_kind}",
+                    "label": f"TL {tf.upper()}",
                     "visible_on": visible_on.get(tf, [tf]),
                     "line": line,
+                    "structure_status": "RECENT_OK",
                     "bias": geometry.get("bias", "NEUTRAL"),
                     "confidence_score": geometry.get("confidence_score", 0),
                 }

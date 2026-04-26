@@ -37,9 +37,11 @@ const OMEGA_UI = {
 
   connectedAt: null,
   lastServerMessageAt: null,
+  lastEventType: null,
   lastStatus: null,
 
   symbols: new Map(),
+  visualStates: new Map(),
   scannerAlerts: [],
   systemEvents: [],
 };
@@ -52,14 +54,28 @@ const OMEGA_CHART = {
 
   selectedSymbol: null,
   selectedTf: "15m",
+  lastSetDataKey: null,
 
   candles: new Map(),
+  overlaySeries: [],
+  emaSeries: new Map(),
+  trendlineSeries: new Map(),
+  pivotMarkers: [],
+  overlayMarkers: [],
+  emaCrossMarkers: [],
+  bestAlertMarkers: [],
+  setupPriceLines: [],
+  activeTradesSidebarCollapsed: false,
+  activeTradesSidebarBound: false,
 };
 
 const OMEGA_CONFIG = {
   maxAlerts: 30,
   maxSystemEvents: 40,
-  maxCandlesPerKey: 1000,
+  maxCandlesPerKey: 1500,
+  showDebugPivots: false,
+  debugStructureMarkers: false,
+  showEmaCrossMarkers: true,
 
   reconnectMinMs: 1000,
   reconnectMaxMs: 15000,
@@ -275,6 +291,8 @@ function sendWs(payload) {
  * ============================================================ */
 
 function handleBackendMessage(message) {
+  OMEGA_UI.lastEventType = message?.type || "unknown";
+
   switch (message.type) {
     case "hello":
       handleHello(message);
@@ -284,8 +302,18 @@ function handleBackendMessage(message) {
       handleStatus(message.data || message.status || message);
       break;
 
+    case "bootstrap_state":
+    case "state_sync":
+      applyBootstrapState(message.data || message);
+      break;
+
+    case "visual_state":
+      applyVisualState(message.data || message);
+      break;
+
     case "snapshot":
-      applySnapshot(message.data || message);
+      // Deprecated compat legacy: server.py ya no debe enviar "snapshot".
+      applyBootstrapState(message.data || message);
       break;
 
     case "market_batch":
@@ -293,7 +321,15 @@ function handleBackendMessage(message) {
       break;
 
     case "scanner_alert":
-      applyScannerAlert(message.data || message);
+      if ((message.data || message).type === "visual_state") {
+        applyVisualState(message.data || message);
+      } else {
+        applyScannerAlert(message.data || message);
+      }
+      break;
+
+    case "system":
+      applySystemEvent(message);
       break;
 
     case "pong":
@@ -352,7 +388,16 @@ function applyMarketBatch(message) {
     }
 
     if (event.type === "scanner_alert") {
-      applyScannerAlert(event.data || event);
+      if ((event.data || event).type === "visual_state") {
+        applyVisualState(event.data || event);
+      } else {
+        applyScannerAlert(event.data || event);
+      }
+      continue;
+    }
+
+    if (event.type === "visual_state") {
+      applyVisualState(event.data || event);
       continue;
     }
 
@@ -364,13 +409,13 @@ function applyMarketBatch(message) {
 }
 
 /* ============================================================
- * Snapshot WS inicial
+ * Bootstrap / state sync inicial por WS
  * ============================================================ */
 
-function applySnapshot(payload) {
+function applyBootstrapState(payload) {
   /**
-   * Esto NO es snapshot REST ni polling.
-   * Es hidratación inicial por WebSocket desde server.py.
+   * Esto NO es polling REST.
+   * Es bootstrap inicial (state sync) por WebSocket desde server.py.
    */
 
   const data = payload.data || payload;
@@ -412,6 +457,10 @@ function applySnapshot(payload) {
         }
 
         setChartCandles(symbol, tf, candles);
+        const latest = candles[candles.length - 1];
+        if (latest) {
+          state.klines.set(tf, latest);
+        }
       }
     }
   }
@@ -463,6 +512,11 @@ function applyKline(data) {
 function applyScannerAlert(alert) {
   if (!alert || typeof alert !== "object") return;
 
+  if (alert.type === "visual_state") {
+    applyVisualState(alert);
+    return;
+  }
+
   OMEGA_UI.scannerAlerts.unshift({
     ...alert,
     receivedAt: Date.now(),
@@ -472,6 +526,20 @@ function applyScannerAlert(alert) {
     0,
     OMEGA_CONFIG.maxAlerts
   );
+}
+
+function applyVisualState(payload) {
+  if (!payload || typeof payload !== "object") return;
+
+  const symbol = normalizeSymbol(payload.symbol);
+  if (!symbol) return;
+
+  OMEGA_UI.visualStates.set(symbol, payload);
+
+  if (OMEGA_CHART.selectedSymbol === symbol) {
+    renderOverlayLayers();
+    renderScannerPanels();
+  }
 }
 
 function applySystemEvent(event) {
@@ -569,10 +637,10 @@ function mountVisualSlots() {
 }
 
 function mountWatchlistPanel() {
-  const panel = findWatchlistPanel();
+  const panel = document.querySelector("#watchlist");
 
   if (!panel) {
-    mountStandaloneFallback();
+    console.warn("[Omega UI] No existe #watchlist en index.html");
     return;
   }
 
@@ -627,23 +695,9 @@ function mountWatchlistPanel() {
 }
 
 function mountRightPanels() {
-  const decision = findPanelByTitle("DECISIÓN DEL SCANNER", {
-    minWidth: 180,
-    maxWidth: 520,
-    minHeight: 40,
-  });
-
-  const geometry = findPanelByTitle("GEOMETRÍA M15", {
-    minWidth: 180,
-    maxWidth: 520,
-    minHeight: 40,
-  });
-
-  const plan = findPanelByTitle("PLAN", {
-    minWidth: 180,
-    maxWidth: 520,
-    minHeight: 40,
-  });
+  const decision = document.querySelector("#scannerDecisionPanel");
+  const geometry = document.querySelector("#geometryM15Panel");
+  const plan = document.querySelector("#planPanel");
 
   if (decision && !decision.querySelector("#omegaDecisionBody")) {
     decision.insertAdjacentHTML(
@@ -673,10 +727,10 @@ function mountChartPanel() {
     return OMEGA_CHART.container;
   }
 
-  const panel = findMainChartPanel();
+  const panel = document.querySelector("#chart");
 
   if (!panel) {
-    console.warn("[Omega Chart] No encontré panel central para montar el gráfico.");
+    console.warn("[Omega Chart] No existe #chart en index.html.");
     return null;
   }
 
@@ -705,6 +759,15 @@ function mountChartPanel() {
         <div id="omegaChartEmpty" class="omega-chart-empty">
           Esperando velas desde el Market Hub…
         </div>
+        <aside id="omegaActiveTradesSidebar" class="omega-active-trades-sidebar">
+          <div class="omega-active-trades-head">
+            <strong>Trades activos</strong>
+            <button type="button" data-active-trades-toggle="1">Ocultar</button>
+          </div>
+          <div id="omegaActiveTradesBody" class="omega-active-trades-body">
+            <div class="omega-muted">Sin trades activos.</div>
+          </div>
+        </aside>
       </div>
     </div>
   `;
@@ -717,151 +780,9 @@ function mountChartPanel() {
   });
 
   OMEGA_CHART.container = panel.querySelector("#omegaChartMount");
+  bindActiveTradesSidebarEvents();
 
   return OMEGA_CHART.container;
-}
-
-function mountStandaloneFallback() {
-  if (document.querySelector("#omegaStandaloneRoot")) return;
-
-  const root = document.createElement("div");
-  root.id = "omegaStandaloneRoot";
-  root.className = "omega-standalone-root";
-
-  root.innerHTML = `
-    <div class="omega-watchlist-head">
-      <div>
-        <div class="omega-panel-label">OMEGA VISUAL LAB</div>
-        <div class="omega-title">Omega Realtime</div>
-        <div class="omega-subtitle">Market Hub · Backend WS</div>
-      </div>
-
-      <div id="omegaConnectionDot" class="omega-conn-dot is-connecting"></div>
-    </div>
-
-    <div id="omegaConnectionText" class="omega-connection-text">
-      Conectando…
-    </div>
-
-    <div class="omega-actions">
-      <button id="omegaReconnectBtn" type="button">Reconectar</button>
-      <button id="omegaStopBtn" type="button">Detener</button>
-    </div>
-
-    <div id="omegaWatchlistRows" class="omega-watchlist-rows"></div>
-  `;
-
-  document.body.appendChild(root);
-}
-
-/* ============================================================
- * Selectores defensivos de layout
- * ============================================================ */
-
-function findWatchlistPanel() {
-  return (
-    document.querySelector("#watchlist") ||
-    document.querySelector("#watchlistPanel") ||
-    document.querySelector("[data-panel='watchlist']") ||
-    document.querySelector("[data-slot='watchlist']") ||
-    document.querySelector(".watchlist-panel") ||
-    document.querySelector(".watchlist") ||
-    findPanelByTitle("WATCHLIST", {
-      minWidth: 120,
-      maxWidth: 360,
-      minHeight: 120,
-    })
-  );
-}
-
-function findMainChartPanel() {
-  return (
-    document.querySelector("#chart") ||
-    document.querySelector("#chartContainer") ||
-    document.querySelector("#omegaChart") ||
-    document.querySelector("[data-panel='chart']") ||
-    document.querySelector("[data-slot='chart']") ||
-    document.querySelector(".chart-panel") ||
-    document.querySelector(".main-chart") ||
-    document.querySelector(".visual-chart") ||
-    findLargestEmptyPanel()
-  );
-}
-
-function findPanelByTitle(title, options = {}) {
-  const wanted = normalizeText(title);
-
-  const minWidth = options.minWidth ?? 0;
-  const maxWidth = options.maxWidth ?? Infinity;
-  const minHeight = options.minHeight ?? 0;
-  const maxHeight = options.maxHeight ?? Infinity;
-
-  const candidates = Array.from(
-    document.querySelectorAll("aside, section, article, div")
-  );
-
-  let best = null;
-  let bestArea = Infinity;
-
-  for (const element of candidates) {
-    if (element.id && element.id.startsWith("omega")) continue;
-
-    const rect = element.getBoundingClientRect();
-
-    if (rect.width < minWidth || rect.width > maxWidth) continue;
-    if (rect.height < minHeight || rect.height > maxHeight) continue;
-
-    const text = normalizeText(element.textContent || "");
-    if (!text.includes(wanted)) continue;
-
-    const area = rect.width * rect.height;
-
-    if (area < bestArea) {
-      best = element;
-      bestArea = area;
-    }
-  }
-
-  return best;
-}
-
-function findLargestEmptyPanel() {
-  const candidates = Array.from(
-    document.querySelectorAll("section, article, div, main")
-  );
-
-  let best = null;
-  let bestArea = 0;
-
-  for (const element of candidates) {
-    if (element.id && element.id.startsWith("omega")) continue;
-    if (element.closest("#omegaStandaloneRoot")) continue;
-    if (element.querySelector("#omegaWatchlistRows")) continue;
-    if (element.querySelector("#omegaDecisionBody")) continue;
-    if (element.querySelector("#omegaGeometryBody")) continue;
-    if (element.querySelector("#omegaPlanBody")) continue;
-
-    const rect = element.getBoundingClientRect();
-
-    if (rect.width < 420 || rect.height < 260) continue;
-
-    const text = String(element.textContent || "").trim();
-
-    /**
-     * Buscamos el panel central vacío. Si tiene mucho texto,
-     * probablemente es un contenedor padre y no el chart panel real.
-     */
-    if (text.length > 120) continue;
-
-    const area = rect.width * rect.height;
-
-    if (area > bestArea) {
-      best = element;
-      bestArea = area;
-    }
-  }
-
-  return best;
 }
 
 function hookExternalTimeframeButtons() {
@@ -871,28 +792,19 @@ function hookExternalTimeframeButtons() {
    * los usamos también.
    */
 
-  const buttons = Array.from(document.querySelectorAll("button"));
+  const buttons = Array.from(document.querySelectorAll("[data-chart-tf]"));
 
   for (const button of buttons) {
-    const tf = parseTfFromText(button.textContent || "");
+    if (button.dataset.omegaTfBound === "1") continue;
+    const tf = String(button.getAttribute("data-chart-tf") || "").toLowerCase();
 
-    if (!tf) continue;
+    if (!OMEGA_CONFIG.tfOrder.includes(tf)) continue;
 
     button.addEventListener("click", () => {
       selectChartTf(tf);
     });
+    button.dataset.omegaTfBound = "1";
   }
-}
-
-function parseTfFromText(text) {
-  const normalized = normalizeText(text);
-
-  if (normalized.includes("M15")) return "15m";
-  if (normalized.includes("M5")) return "5m";
-  if (normalized.includes("M3")) return "3m";
-  if (normalized.includes("M1")) return "1m";
-
-  return null;
 }
 
 function normalizeText(value) {
@@ -910,8 +822,144 @@ function normalizeText(value) {
 function renderAll() {
   renderWatchlist();
   renderScannerPanels();
+  renderActiveTradesSidebar();
   renderConnectionMeta();
   syncChartButtons();
+}
+
+function bindActiveTradesSidebarEvents() {
+  if (OMEGA_CHART.activeTradesSidebarBound) return;
+  const sidebar = document.querySelector("#omegaActiveTradesSidebar");
+  if (!sidebar) return;
+
+  sidebar.addEventListener("click", (event) => {
+    const toggleBtn = event.target.closest("[data-active-trades-toggle='1']");
+    if (toggleBtn) {
+      OMEGA_CHART.activeTradesSidebarCollapsed = !OMEGA_CHART.activeTradesSidebarCollapsed;
+      renderActiveTradesSidebar();
+      return;
+    }
+
+    const tfBtn = event.target.closest("[data-active-trade-tf]");
+    if (tfBtn) {
+      const tf = String(tfBtn.getAttribute("data-active-trade-tf") || "").toLowerCase();
+      if (OMEGA_CONFIG.tfOrder.includes(tf)) {
+        selectChartTf(tf);
+      }
+      return;
+    }
+  });
+
+  OMEGA_CHART.activeTradesSidebarBound = true;
+}
+
+function getActiveTradesForSidebar(visualState, selectedTf) {
+  if (!visualState || typeof visualState !== "object") return [];
+  const bestByTf = visualState.best_plan_by_tf || {};
+  const overlaysByTf = visualState.chart_plan_overlays || {};
+  const fallbackByTf = visualState.trade_setups_by_tf || {};
+  const primaryTrade = visualState.primary_trade || {};
+  const tree = visualState.fractal_trade_tree || {};
+  const excludedStatuses = new Set([
+    "INSUFFICIENT_STRUCTURE",
+    "INVALID_LEVEL_ORDER",
+    "CONFLICT",
+    "MACRO_SETUP_INVALIDATED",
+    "SETUP_INVALIDATED",
+    "M1_TRIGGER_INVALIDATED",
+  ]);
+  const tfPriority = new Map([["15m", 0], [String(selectedTf || "").toLowerCase(), 1], ["5m", 2], ["3m", 3], ["1m", 4]]);
+  const seen = new Set();
+  const out = [];
+
+  const pushTrade = (tf, candidate, { primary = false } = {}) => {
+    if (!candidate || typeof candidate !== "object") return;
+    const status = String(candidate.status || "").toUpperCase();
+    const isCriticalM15 = tf === "15m" && status === "MACRO_SETUP_INVALIDATED";
+    if (excludedStatuses.has(status) && !isCriticalM15) return;
+    const direction = String(candidate.direction || "NONE").toUpperCase();
+    const entry = toNumber(candidate.entry);
+    const sl = toNumber(candidate.stop_loss);
+    const dedupeKey = `${tf}|${candidate.plan_id || candidate.id || ""}|${direction}|${entry ?? "x"}|${sl ?? "x"}`;
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+    out.push({
+      tf,
+      direction,
+      status: candidate.status || "—",
+      entry,
+      stop_loss: sl,
+      tp1: toNumber(candidate.tp1),
+      tp2: toNumber(candidate.tp2),
+      tp3: toNumber(candidate.tp3),
+      primary,
+      rearm_allowed: tree.rearm_allowed,
+      macro_valid: tree.macro_valid,
+      reason: candidate.reason || tree.reason || "",
+    });
+  };
+
+  pushTrade("15m", bestByTf["15m"] || primaryTrade || overlaysByTf["15m"], { primary: true });
+  for (const tf of OMEGA_CONFIG.tfOrder) {
+    pushTrade(tf, bestByTf[tf] || overlaysByTf[tf] || fallbackByTf[tf], { primary: tf === "15m" });
+  }
+
+  return out
+    .sort((a, b) => (tfPriority.get(a.tf) ?? 99) - (tfPriority.get(b.tf) ?? 99))
+    .slice(0, 6);
+}
+
+function renderActiveTradesSidebar() {
+  const sidebar = document.querySelector("#omegaActiveTradesSidebar");
+  const body = document.querySelector("#omegaActiveTradesBody");
+  const toggleBtn = document.querySelector("[data-active-trades-toggle='1']");
+  if (!sidebar || !body || !toggleBtn) return;
+
+  const selectedSymbol = OMEGA_CHART.selectedSymbol;
+  const selectedTf = OMEGA_CHART.selectedTf;
+  const visualState = selectedSymbol ? OMEGA_UI.visualStates.get(selectedSymbol) : null;
+  const trades = getActiveTradesForSidebar(visualState, selectedTf);
+
+  sidebar.classList.toggle("is-collapsed", OMEGA_CHART.activeTradesSidebarCollapsed);
+  toggleBtn.textContent = OMEGA_CHART.activeTradesSidebarCollapsed ? "Mostrar" : "Ocultar";
+
+  if (OMEGA_CHART.activeTradesSidebarCollapsed) {
+    body.innerHTML = "";
+    return;
+  }
+  if (!trades.length) {
+    body.innerHTML = `<div class="omega-muted">Sin trades activos.</div>`;
+    return;
+  }
+
+  body.innerHTML = trades
+    .map((trade) => {
+      const detailHref = `plan.html?symbol=${encodeURIComponent(selectedSymbol || visualState?.symbol || "")}&tf=${encodeURIComponent(trade.tf)}`;
+      const directionClass = trade.direction === "LONG" ? "is-long" : trade.direction === "SHORT" ? "is-short" : "is-neutral";
+      return `
+        <article class="omega-active-trade-card ${directionClass}" data-active-trade-tf="${escapeHtml(trade.tf)}">
+          <div class="omega-active-trade-top">
+            <span class="omega-active-trade-tf">${escapeHtml(trade.tf.toUpperCase())}</span>
+            <span class="omega-active-trade-dir">${escapeHtml(trade.direction)}</span>
+            ${trade.primary ? `<span class="omega-active-trade-pill">Primary</span>` : ""}
+          </div>
+          <div class="omega-active-trade-status">${escapeHtml(trade.status)}</div>
+          <div class="omega-active-trade-levels">
+            <span>E ${formatCompactPrice(trade.entry)}</span>
+            <span>SL ${formatCompactPrice(trade.stop_loss)}</span>
+            <span>TP1 ${formatCompactPrice(trade.tp1)}</span>
+            <span>TP2 ${formatCompactPrice(trade.tp2)}</span>
+            <span>TP3 ${formatCompactPrice(trade.tp3)}</span>
+          </div>
+          <div class="omega-active-trade-meta">
+            <span>Rearm ${escapeHtml(String(trade.rearm_allowed ?? "—"))}</span>
+            <span>Macro ${escapeHtml(String(trade.macro_valid ?? "—"))}</span>
+            <a href="${detailHref}" target="_blank" rel="noopener noreferrer">Detalle</a>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
 }
 
 function renderWatchlist() {
@@ -986,88 +1034,122 @@ function renderTfPill(label, candle) {
 }
 
 function renderScannerPanels() {
-  const latest = OMEGA_UI.scannerAlerts[0];
+  const selectedSymbol = OMEGA_CHART.selectedSymbol;
+  const visualState = selectedSymbol
+    ? OMEGA_UI.visualStates.get(selectedSymbol)
+    : null;
+  const scannerView = visualState?.scanner_view || OMEGA_UI.scannerAlerts[0];
+  const fractalState = visualState?.fractal_state || null;
+  const fractalTree = visualState?.fractal_trade_tree || null;
+  const primaryTrade = visualState?.best_plan_by_tf?.["15m"] || visualState?.primary_trade || null;
+  const bestPlanByTf = visualState?.best_plan_by_tf || {};
+  const tradeSetupsByTf = visualState?.trade_setups_by_tf || {};
+  const emaCrossesByTf = visualState?.ema_crosses_by_tf || {};
+  const structureByTf = visualState?.structure_by_tf || {};
+  const geometryByTf = visualState?.geometry_by_tf || {};
+  const trendlines = visualState?.overlays?.trendlines || [];
 
   const decision = document.querySelector("#omegaDecisionBody");
   const geometry = document.querySelector("#omegaGeometryBody");
   const plan = document.querySelector("#omegaPlanBody");
 
   if (decision) {
-    if (!latest) {
+    if (!scannerView) {
       decision.innerHTML = `<span class="omega-muted">Sin alertas todavía.</span>`;
     } else {
+      const blockers = Array.isArray(scannerView.blockers)
+        ? scannerView.blockers.join(", ")
+        : "—";
+      const degraders = Array.isArray(scannerView.degraders)
+        ? scannerView.degraders.join(", ")
+        : "—";
       decision.innerHTML = `
-        <div class="omega-decision-main">
-          ${escapeHtml(latest.side || "—")} · ${escapeHtml(latest.symbol || "—")}
-        </div>
-
-        <div class="omega-decision-sub">
-          ${escapeHtml(latest.type || latest.signal_type || "Señal")} ·
-          Calidad: ${escapeHtml(latest.quality || latest.calidad || "—")}
-        </div>
-
-        <div class="omega-decision-reason">
-          ${escapeHtml(latest.reason || latest.motivo || "Sin motivo detallado.")}
-        </div>
+        <div class="omega-kv"><span>Resultado</span><strong>${escapeHtml(scannerView.result || scannerView.side || "—")}</strong></div>
+        <div class="omega-kv"><span>Tipo</span><strong>${escapeHtml(scannerView.type || scannerView.signal_type || "—")}</strong></div>
+        <div class="omega-kv"><span>Calidad</span><strong>${escapeHtml(scannerView.quality || scannerView.calidad || "—")}</strong></div>
+        <div class="omega-kv"><span>Alert allowed</span><strong>${escapeHtml(String(scannerView.alert_allowed ?? "—"))}</strong></div>
+        <div class="omega-kv"><span>Geometry score</span><strong>${escapeHtml(scannerView.geometry_score ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Indicator score</span><strong>${escapeHtml(scannerView.indicator_score ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Total score</span><strong>${escapeHtml(scannerView.total_score ?? scannerView.score ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Blockers</span><strong>${escapeHtml(blockers)}</strong></div>
+        <div class="omega-kv"><span>Degraders</span><strong>${escapeHtml(degraders)}</strong></div>
+        <div class="omega-kv"><span>Último cruce M15</span><strong>${escapeHtml(formatLastCross(emaCrossesByTf["15m"]))}</strong></div>
       `;
     }
   }
 
   if (geometry) {
-    if (!latest) {
-      geometry.innerHTML = `<span class="omega-muted">Esperando estructura M15.</span>`;
+    if (!visualState) {
+      geometry.innerHTML = `<span class="omega-muted">Esperando estado visual multi-TF.</span>`;
     } else {
-      geometry.innerHTML = `
-        <div class="omega-kv">
-          <span>Símbolo</span>
-          <strong>${escapeHtml(latest.symbol || "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Fuente</span>
-          <strong>${escapeHtml(latest.source_tf || latest.timeframe || "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Geometría</span>
-          <strong>${escapeHtml(latest.geometry_score ?? "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Total</span>
-          <strong>${escapeHtml(latest.total_score ?? latest.score ?? "—")}</strong>
-        </div>
-      `;
+      const tfRows = ["15m", "5m", "3m", "1m"].map((tf) => {
+        const g = geometryByTf[tf] || {};
+        const s = structureByTf[tf] || {};
+        const swings = Array.isArray(g.swing_points) ? g.swing_points.length : 0;
+        const tfTrendlines = trendlines.filter((line) => {
+          const source = String(line.source_tf || line.source_timeframe || "").toLowerCase();
+          return source === tf;
+        }).length;
+        return `
+          <div class="omega-kv"><span>${tf.toUpperCase()} geom</span><strong>${escapeHtml(g.bias ?? "—")} · ${escapeHtml(g.confidence_score ?? "—")}</strong></div>
+          <div class="omega-kv"><span>${tf.toUpperCase()} struct</span><strong>${escapeHtml(s.bias ?? "—")} · BOS ${escapeHtml(s.bos ?? "—")} · CHoCH ${escapeHtml(s.choch ?? "—")} · PB ${escapeHtml(s.pullback ?? "—")}</strong></div>
+          <div class="omega-kv"><span>${tf.toUpperCase()} swings/TLs</span><strong>${swings} / ${tfTrendlines}</strong></div>
+        `;
+      });
+      geometry.innerHTML = tfRows.join("");
     }
   }
 
   if (plan) {
-    if (!latest) {
+    if (!fractalState && !fractalTree) {
       plan.innerHTML = `<span class="omega-muted">Sin plan activo.</span>`;
     } else {
+      const tree = fractalTree || {};
+      const lifecycle = tree.status ?? fractalState?.lifecycle_state;
+      const macroValid = tree.macro_valid ?? fractalState?.macro_valid;
+      const macroInvalidated =
+        tree.macro_invalidated ?? fractalState?.macro_invalidated;
+      const m1Trigger =
+        tree.m1_trigger_status ?? fractalState?.m1_trigger_status ?? "—";
+      const rearmAllowed = tree.rearm_allowed ?? fractalState?.rearm_allowed;
+      const action =
+        tree.recommended_action ?? fractalState?.recommended_action ?? "—";
+      const reason = tree.reason ?? fractalState?.reason ?? "—";
+      const setupRows = ["15m", "5m", "3m", "1m"]
+        .map((tf) => {
+          const setup = bestPlanByTf[tf] || tradeSetupsByTf[tf] || {};
+          return `<div class="omega-kv"><span>Setup ${tf.toUpperCase()}</span><strong>${escapeHtml(
+            setup.status ?? "—"
+          )} · ${escapeHtml(setup.direction ?? "—")}</strong></div>`;
+        })
+        .join("");
+      const detailTf = OMEGA_CHART.selectedTf || "15m";
+      const detailSymbol = OMEGA_CHART.selectedSymbol || visualState?.symbol || "";
+      const detailHref = `plan.html?symbol=${encodeURIComponent(detailSymbol)}&tf=${encodeURIComponent(detailTf)}`;
       plan.innerHTML = `
-        <div class="omega-kv">
-          <span>Precio</span>
-          <strong>${formatPrice(latest.price)}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Tipo</span>
-          <strong>${escapeHtml(latest.type || latest.signal_type || "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>ID</span>
-          <strong>${escapeHtml(String(latest.fingerprint || latest.plan_id || "—").slice(0, 14))}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Hora</span>
-          <strong>${formatTime(latest.server_time_ms || latest.receivedAt)}</strong>
+        <div class="omega-kv"><span>Primary M15</span><strong>${escapeHtml(primaryTrade?.status ?? "—")} · ${escapeHtml(primaryTrade?.direction ?? "—")}</strong></div>
+        <div class="omega-kv"><span>M15 Entry/SL</span><strong>${formatPrice(primaryTrade?.entry)} / ${formatPrice(primaryTrade?.stop_loss)}</strong></div>
+        <div class="omega-kv"><span>M15 TP1/TP2/TP3</span><strong>${formatPrice(primaryTrade?.tp1)} / ${formatPrice(primaryTrade?.tp2)} / ${formatPrice(primaryTrade?.tp3)}</strong></div>
+        <div class="omega-kv"><span>Lifecycle</span><strong>${escapeHtml(lifecycle ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Macro valid</span><strong>${escapeHtml(String(macroValid ?? "—"))}</strong></div>
+        <div class="omega-kv"><span>Macro invalidated</span><strong>${escapeHtml(String(macroInvalidated ?? "—"))}</strong></div>
+        <div class="omega-kv"><span>M1 trigger</span><strong>${escapeHtml(String(m1Trigger ?? "—"))}</strong></div>
+        <div class="omega-kv"><span>Rearm allowed</span><strong>${escapeHtml(String(rearmAllowed ?? "—"))}</strong></div>
+        <div class="omega-kv"><span>Action</span><strong>${escapeHtml(action)}</strong></div>
+        <div class="omega-kv"><span>Reason</span><strong>${escapeHtml(reason)}</strong></div>
+        ${setupRows}
+        <div class="omega-plan-detail-cta">
+          <a class="omega-plan-detail-btn" target="_blank" rel="noopener noreferrer" href="${detailHref}">Ver detalle del plan</a>
         </div>
       `;
     }
   }
+}
+
+function formatLastCross(crossList) {
+  if (!Array.isArray(crossList) || !crossList.length) return "—";
+  const latest = crossList[crossList.length - 1] || {};
+  return `${latest.type || "—"} @ ${formatTime((latest.time || 0) * 1000)}`;
 }
 
 function renderConnectionMeta() {
@@ -1084,6 +1166,23 @@ function renderConnectionMeta() {
     : "Binance…";
 
   text.textContent = `${count} símbolos · ${binanceState} · Último evento: ${last}`;
+
+  const wsStatus = document.querySelector("#workspaceStatus");
+  if (wsStatus) {
+    const candleCount = getSelectedCandleCount();
+    wsStatus.textContent = `Backend ${
+      OMEGA_UI.ws?.readyState === WebSocket.OPEN ? "conectado" : "desconectado"
+    } · Evento ${OMEGA_UI.lastEventType || "—"} · Velas ${candleCount}`;
+  }
+}
+
+function getSelectedCandleCount() {
+  if (!OMEGA_CHART.selectedSymbol || !OMEGA_CHART.selectedTf) return 0;
+  return (
+    OMEGA_CHART.candles.get(
+      candleKey(OMEGA_CHART.selectedSymbol, OMEGA_CHART.selectedTf)
+    ) || []
+  ).length;
 }
 
 function setConnectionState(kind, label) {
@@ -1109,9 +1208,11 @@ function candleKey(symbol, timeframe) {
 
 function setChartCandles(symbol, timeframe, candles) {
   const key = candleKey(symbol, timeframe);
-
-  const cleaned = candles
-    .filter(isValidChartCandle)
+  const byTime = new Map();
+  for (const candle of candles.filter(isValidChartCandle)) {
+    byTime.set(candle.time, candle);
+  }
+  const cleaned = Array.from(byTime.values())
     .sort((a, b) => a.time - b.time)
     .slice(-OMEGA_CONFIG.maxCandlesPerKey);
 
@@ -1256,17 +1357,16 @@ function ensureChart() {
 
 function createCandlestickSeriesCompat(chart) {
   const lightweight = window.LightweightCharts;
+  const selectedSymbol = normalizeSymbol(OMEGA_CHART.selectedSymbol || "");
+  const referencePrice = OMEGA_UI.symbols.get(selectedSymbol)?.markPrice;
+  const dynamicPriceFormat = getPriceFormatForSymbol(selectedSymbol, referencePrice);
 
   /**
    * Lightweight Charts v4.
    */
   if (typeof chart.addCandlestickSeries === "function") {
     return chart.addCandlestickSeries({
-      priceFormat: {
-        type: "price",
-        precision: 8,
-        minMove: 0.00000001,
-      },
+      priceFormat: dynamicPriceFormat,
     });
   }
 
@@ -1279,17 +1379,23 @@ function createCandlestickSeriesCompat(chart) {
     lightweight.CandlestickSeries
   ) {
     return chart.addSeries(lightweight.CandlestickSeries, {
-      priceFormat: {
-        type: "price",
-        precision: 8,
-        minMove: 0.00000001,
-      },
+      priceFormat: dynamicPriceFormat,
     });
   }
 
   throw new Error(
     "Versión incompatible de Lightweight Charts. No existe addCandlestickSeries ni addSeries(CandlestickSeries)."
   );
+}
+
+function applyPriceFormatForSelection() {
+  if (!OMEGA_CHART.candleSeries) return;
+  const selectedSymbol = normalizeSymbol(OMEGA_CHART.selectedSymbol || "");
+  const referencePrice = OMEGA_UI.symbols.get(selectedSymbol)?.markPrice;
+  const format = getPriceFormatForSymbol(selectedSymbol, referencePrice);
+  if (typeof OMEGA_CHART.candleSeries.applyOptions === "function") {
+    OMEGA_CHART.candleSeries.applyOptions({ priceFormat: format });
+  }
 }
 
 function setupChartResizeObserver(container) {
@@ -1318,11 +1424,13 @@ function renderSelectedChart() {
   updateChartHeader(symbol, timeframe);
 
   if (!symbol || !timeframe) {
+    clearOverlaySeries();
     showChartEmpty("Seleccioná un símbolo para ver el gráfico.");
     return;
   }
 
   if (!ensureChart()) return;
+  applyPriceFormatForSelection();
 
   const key = candleKey(symbol, timeframe);
   const candles = OMEGA_CHART.candles.get(key) || [];
@@ -1330,6 +1438,8 @@ function renderSelectedChart() {
   updateChartHeader(symbol, timeframe, candles.length);
 
   if (!candles.length) {
+    clearOverlaySeries();
+    setSeriesMarkersCompat(OMEGA_CHART.candleSeries, []);
     showChartEmpty(
       `Sin velas todavía para ${symbol} ${timeframe.toUpperCase()}. Esperando Market Hub…`
     );
@@ -1342,10 +1452,16 @@ function renderSelectedChart() {
 
   try {
     OMEGA_CHART.candleSeries.setData(chartData);
+    const dataKey = `${key}::${chartData.length}`;
 
-    if (OMEGA_CHART.chart.timeScale) {
+    if (
+      OMEGA_CHART.chart.timeScale &&
+      OMEGA_CHART.lastSetDataKey !== dataKey
+    ) {
       OMEGA_CHART.chart.timeScale().fitContent();
     }
+    OMEGA_CHART.lastSetDataKey = dataKey;
+    renderOverlayLayers();
   } catch (err) {
     console.error("[Omega Chart] Error seteando datos:", err);
     showChartEmpty(`Error seteando datos del chart: ${err.message || err}`);
@@ -1354,6 +1470,7 @@ function renderSelectedChart() {
 
 function updateChartCandle(candle) {
   if (!ensureChart()) return;
+  applyPriceFormatForSelection();
 
   hideChartEmpty();
 
@@ -1364,8 +1481,430 @@ function updateChartCandle(candle) {
     const candles = OMEGA_CHART.candles.get(key) || [];
 
     updateChartHeader(candle.symbol, candle.timeframe, candles.length);
+    renderOverlayLayers();
   } catch (err) {
     console.error("[Omega Chart] Error actualizando vela:", err);
+  }
+}
+
+function renderOverlayLayers() {
+  const symbol = OMEGA_CHART.selectedSymbol;
+  const tf = OMEGA_CHART.selectedTf;
+  if (!symbol || !tf || !OMEGA_CHART.chart || !OMEGA_CHART.candleSeries) return;
+
+  const visualState = OMEGA_UI.visualStates.get(symbol);
+  clearOverlaySeries();
+
+  if (!visualState) {
+    setSeriesMarkersCompat(OMEGA_CHART.candleSeries, []);
+    return;
+  }
+
+  renderEmaOverlays(visualState, tf);
+  renderTrendlineOverlays(visualState, tf);
+  if (OMEGA_CONFIG.showDebugPivots || OMEGA_CONFIG.debugStructureMarkers) {
+    renderPivotMarkers(visualState, tf);
+  } else {
+    OMEGA_CHART.pivotMarkers = [];
+  }
+  renderEmaCrossMarkers(visualState, tf);
+  renderBestAlertMarkers(visualState, tf);
+  renderSetupLevelOverlays(visualState, tf);
+  setCombinedChartMarkers();
+}
+
+function clearOverlaySeries() {
+  if (!OMEGA_CHART.chart) return;
+
+  for (const series of OMEGA_CHART.overlaySeries) {
+    removeSeriesCompat(OMEGA_CHART.chart, series);
+  }
+
+  OMEGA_CHART.overlaySeries = [];
+  OMEGA_CHART.emaSeries.clear();
+  OMEGA_CHART.trendlineSeries.clear();
+  OMEGA_CHART.pivotMarkers = [];
+  OMEGA_CHART.overlayMarkers = [];
+  OMEGA_CHART.emaCrossMarkers = [];
+  OMEGA_CHART.bestAlertMarkers = [];
+  clearSetupPriceLines();
+}
+
+function removeSeriesCompat(chart, series) {
+  if (!chart || !series) return;
+  if (typeof chart.removeSeries === "function") {
+    chart.removeSeries(series);
+  }
+}
+
+function createLineSeriesCompat(chart, options) {
+  const lightweight = window.LightweightCharts;
+
+  if (typeof chart.addLineSeries === "function") {
+    return chart.addLineSeries(options);
+  }
+
+  if (
+    typeof chart.addSeries === "function" &&
+    lightweight &&
+    lightweight.LineSeries
+  ) {
+    return chart.addSeries(lightweight.LineSeries, options);
+  }
+
+  return null;
+}
+
+function renderEmaOverlays(visualState, selectedTf) {
+  const byTf = visualState?.ema_series_by_tf || {};
+  const tfEma = byTf[selectedTf] || {};
+
+  const ema55 = Array.isArray(tfEma.ema55) ? tfEma.ema55 : [];
+  const ema200 = Array.isArray(tfEma.ema200) ? tfEma.ema200 : [];
+
+  if (ema55.length) {
+    const series55 = createLineSeriesCompat(OMEGA_CHART.chart, {
+      color: "#22d3ee",
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: true,
+    });
+    if (series55) {
+      series55.setData(ema55.map((item) => ({ time: item.time, value: item.value })));
+      OMEGA_CHART.overlaySeries.push(series55);
+      OMEGA_CHART.emaSeries.set("ema55", series55);
+    }
+  }
+
+  if (ema200.length) {
+    const series200 = createLineSeriesCompat(OMEGA_CHART.chart, {
+      color: "#f59e0b",
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: true,
+    });
+    if (series200) {
+      series200.setData(ema200.map((item) => ({ time: item.time, value: item.value })));
+      OMEGA_CHART.overlaySeries.push(series200);
+      OMEGA_CHART.emaSeries.set("ema200", series200);
+    }
+  }
+}
+
+function normalizeTrendlineTime(value) {
+  const number = toNumber(value);
+  if (number === null) return null;
+  if (number > 1e12) return Math.floor(number / 1000);
+  return Math.floor(number);
+}
+
+function trendlineVisibleOnSelectedTf(tl, selectedTf) {
+  const visibleTfs = new Set(getVisibleChartTimeframes(selectedTf));
+  const sourceTf = String(tl.source_tf || tl.source_timeframe || "").toLowerCase();
+  if (sourceTf && !visibleTfs.has(sourceTf)) return false;
+
+  const visible = Array.isArray(tl.visible_on_tfs)
+    ? tl.visible_on_tfs
+    : Array.isArray(tl.visible_on)
+    ? tl.visible_on
+    : null;
+
+  if (!visible || !visible.length) return true;
+  return visible.map((item) => String(item).toLowerCase()).includes(selectedTf);
+}
+
+function sourceTfColor(sourceTf) {
+  const tf = String(sourceTf || "").toLowerCase();
+  if (tf === "15m") return "#38bdf8";
+  if (tf === "5m") return "#22c55e";
+  if (tf === "3m") return "#f59e0b";
+  return "#a78bfa";
+}
+
+function renderTrendlineOverlays(visualState, selectedTf) {
+  const trendlinesRaw = Array.isArray(visualState?.overlays?.trendlines)
+    ? visualState.overlays.trendlines
+    : [];
+  const trendlinesByRole = new Map();
+
+  for (const tl of trendlinesRaw) {
+    if (!tl || typeof tl !== "object") continue;
+    if (!trendlineVisibleOnSelectedTf(tl, selectedTf)) continue;
+    const sourceTf = String(tl.source_tf || tl.source_timeframe || "unknown").toLowerCase();
+    const kind = String(tl.kind || "").toUpperCase();
+    const normalizedKind = kind.includes("SUPPORT")
+      ? "SUPPORT"
+      : kind.includes("RESIST")
+      ? "RESISTANCE"
+      : "OTHER";
+    const key = `${sourceTf}:${normalizedKind}`;
+    const score = toNumber(tl?.line?.score) ?? toNumber(tl?.confidence_score) ?? 0;
+    const previous = trendlinesByRole.get(key);
+    const prevScore = previous ? toNumber(previous?.line?.score) ?? toNumber(previous?.confidence_score) ?? 0 : -Infinity;
+    if (!previous || score >= prevScore) {
+      trendlinesByRole.set(key, tl);
+    }
+  }
+  const trendlines = Array.from(trendlinesByRole.values());
+
+  for (const tl of trendlines) {
+    const line = tl.line || {};
+    const start = line.start || {};
+    const end = line.end || {};
+
+    const startTime = normalizeTrendlineTime(start.time ?? start.timestamp);
+    const endTime = normalizeTrendlineTime(end.time ?? end.timestamp);
+    const startPrice = toNumber(start.price);
+    const endPrice = toNumber(end.price);
+
+    if (
+      startTime === null ||
+      endTime === null ||
+      startPrice === null ||
+      endPrice === null
+    ) {
+      continue;
+    }
+
+    const sourceTf = String(tl.source_tf || tl.source_timeframe || "unknown").toLowerCase();
+    const color = sourceTfColor(sourceTf);
+    const id = String(tl.id || `${sourceTf}:${tl.kind || "line"}`);
+
+    const series = createLineSeriesCompat(OMEGA_CHART.chart, {
+      color,
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+    if (!series) continue;
+
+    series.setData([
+      { time: startTime, value: startPrice },
+      { time: endTime, value: endPrice },
+    ]);
+
+    OMEGA_CHART.overlaySeries.push(series);
+    OMEGA_CHART.trendlineSeries.set(id, series);
+
+    OMEGA_CHART.overlayMarkers.push({
+      time: endTime,
+      position: "aboveBar",
+      color,
+      shape: "circle",
+      text: String(tl.label || `TL ${sourceTf.toUpperCase()}`),
+    });
+  }
+}
+
+function renderPivotMarkers(visualState, selectedTf) {
+  const points = visualState?.geometry_by_tf?.[selectedTf]?.swing_points;
+  if (!Array.isArray(points) || !points.length) {
+    OMEGA_CHART.pivotMarkers = [];
+    return;
+  }
+
+  const scoredPoints = points
+    .filter((point) => point && typeof point === "object")
+    .map((point) => ({ point, strength: toNumber(point.strength ?? point.score ?? point.touches) ?? 0 }))
+    .sort((a, b) => b.strength - a.strength)
+    .slice(0, 8)
+    .map((item) => item.point)
+    .sort((a, b) => (toNumber(a.time ?? a.timestamp) ?? 0) - (toNumber(b.time ?? b.timestamp) ?? 0));
+  const markers = [];
+
+  for (const point of scoredPoints) {
+    const time = normalizeTrendlineTime(point.time ?? point.timestamp);
+    if (time === null) continue;
+    const kind = String(point.kind || "").toUpperCase();
+    markers.push({
+      time,
+      position: kind === "HIGH" ? "aboveBar" : "belowBar",
+      color: "rgba(148,163,184,0.75)",
+      shape: "circle",
+      text: "",
+    });
+  }
+
+  OMEGA_CHART.pivotMarkers = markers;
+}
+
+function renderEmaCrossMarkers(visualState, selectedTf) {
+  if (!OMEGA_CONFIG.showEmaCrossMarkers) {
+    OMEGA_CHART.emaCrossMarkers = [];
+    return;
+  }
+  const crosses = [];
+  const visibleTfs = getVisibleChartTimeframes(selectedTf);
+  for (const tf of visibleTfs) {
+    const tfCrosses = Array.isArray(visualState?.ema_crosses_by_tf?.[tf])
+      ? visualState.ema_crosses_by_tf[tf].slice(-6)
+      : [];
+    for (const cross of tfCrosses) {
+      crosses.push({ ...cross, tf });
+    }
+  }
+
+  const markers = [];
+  for (const cross of crosses) {
+    const time = normalizeTrendlineTime(cross.time);
+    if (time === null) continue;
+    const isBull = String(cross.type || "").toUpperCase().includes("BULL");
+    const tfTag = String(cross.tf || selectedTf).toUpperCase();
+    markers.push({
+      time,
+      position: isBull ? "belowBar" : "aboveBar",
+      color: isBull ? "#22c55e" : "#ef4444",
+      shape: "cross",
+      text: isBull ? `X↑ ${tfTag}` : `X↓ ${tfTag}`,
+    });
+  }
+  OMEGA_CHART.emaCrossMarkers = markers;
+}
+
+function renderBestAlertMarkers(visualState, selectedTf) {
+  const bestAlertsByTf = visualState?.best_alerts_by_tf || {};
+  const visibleTfs = new Set(getVisibleChartTimeframes(selectedTf));
+  const out = [];
+
+  for (const tf of ["15m", "5m", "3m", "1m"]) {
+    if (!visibleTfs.has(tf)) continue;
+    const alert = bestAlertsByTf[tf];
+    if (!alert || typeof alert !== "object") continue;
+    const time = normalizeTrendlineTime(
+      alert.time ??
+        visualState?.best_plan_by_tf?.[tf]?.source_cross?.time ??
+        visualState?.primary_trade?.source_cross?.time
+    );
+    if (time === null) continue;
+    const severity = String(alert.severity || "info").toLowerCase();
+    const direction = String(alert.direction || "").toUpperCase();
+    const invalidated = severity === "invalidated" || String(alert.type || "").includes("INVALIDATED");
+    const warning = severity === "warning" || String(alert.type || "").includes("REARM");
+    out.push({
+      time,
+      position: invalidated || warning || direction === "SHORT" ? "aboveBar" : "belowBar",
+      color: invalidated ? "#a855f7" : warning ? "#facc15" : direction === "LONG" ? "#22c55e" : direction === "SHORT" ? "#ef4444" : "#60a5fa",
+      shape: "circle",
+      text: invalidated ? "INV" : warning ? "RE" : direction === "LONG" ? "L" : direction === "SHORT" ? "S" : "i",
+    });
+  }
+  OMEGA_CHART.bestAlertMarkers = out;
+}
+
+function clearSetupPriceLines() {
+  if (!OMEGA_CHART.candleSeries) {
+    OMEGA_CHART.setupPriceLines = [];
+    return;
+  }
+
+  for (const line of OMEGA_CHART.setupPriceLines) {
+    if (!line) continue;
+    try {
+      OMEGA_CHART.candleSeries.removePriceLine(line);
+    } catch (_err) {
+      // noop defensivo: la línea puede haber sido removida previamente
+    }
+  }
+
+  OMEGA_CHART.setupPriceLines = [];
+}
+
+function addSetupPriceLine(value, options) {
+  const price = toNumber(value);
+  if (price === null || !OMEGA_CHART.candleSeries) return;
+  const line = OMEGA_CHART.candleSeries.createPriceLine({
+    price,
+    color: options.color,
+    lineWidth: 1,
+    lineStyle: 2,
+    axisLabelVisible: true,
+    title: options.title,
+  });
+  OMEGA_CHART.setupPriceLines.push(line);
+}
+
+function getVisibleChartTimeframes(selectedTf) {
+  const tf = String(selectedTf || "").toLowerCase();
+  if (tf === "15m") return ["15m"];
+  if (OMEGA_CONFIG.tfOrder.includes(tf)) return ["15m", tf];
+  return ["15m"];
+}
+
+function dedupePriceLevels(levels) {
+  if (!Array.isArray(levels) || !levels.length) return [];
+  const sorted = levels
+    .filter((level) => level && typeof level === "object")
+    .slice()
+    .sort((a, b) => (toNumber(a.priority) ?? 999) - (toNumber(b.priority) ?? 999));
+
+  const byKey = new Map();
+  for (const level of sorted) {
+    const price = toNumber(level.price);
+    if (price === null) continue;
+    const rounded = Number(price.toFixed(4));
+    const keyById = level.id ? `id:${String(level.id)}` : null;
+    const keyByKind = level.tf && level.kind
+      ? `tf:${String(level.tf)}|kind:${String(level.kind)}|p:${rounded}`
+      : null;
+    const keyByLabel = level.title
+      ? `label:${String(level.title)}|p:${rounded}`
+      : `fallback:${rounded}`;
+    const key = keyById || keyByKind || keyByLabel;
+    if (!byKey.has(key)) {
+      byKey.set(key, { ...level, price });
+    }
+  }
+
+  return Array.from(byKey.values())
+    .sort((a, b) => (toNumber(a.priority) ?? 999) - (toNumber(b.priority) ?? 999))
+    .slice(0, 10);
+}
+
+function renderSetupLevelOverlays(visualState, selectedTf) {
+  clearSetupPriceLines();
+
+  const bestPlans = visualState?.best_plan_by_tf || {};
+  const fallbackTradeSetups = visualState?.trade_setups_by_tf || {};
+  const visibleTfs = getVisibleChartTimeframes(selectedTf);
+  const levels = [];
+
+  for (const tf of visibleTfs) {
+    const plan = bestPlans[tf] || fallbackTradeSetups[tf] || {};
+    if (!plan || typeof plan !== "object") continue;
+    const isPrimary = tf === "15m";
+    levels.push(
+      { id: `${tf}:entry`, tf, kind: "entry", title: formatLevelLabel(tf, "E", plan.entry), color: isPrimary ? "#93c5fd" : "#38bdf8", price: plan.entry, priority: isPrimary ? 10 : 20 },
+      { id: `${tf}:sl`, tf, kind: "sl", title: formatLevelLabel(tf, "SL", plan.stop_loss), color: isPrimary ? "#fca5a5" : "#ef4444", price: plan.stop_loss, priority: isPrimary ? 11 : 21 },
+      { id: `${tf}:tp1`, tf, kind: "tp1", title: formatLevelLabel(tf, "TP1", plan.tp1), color: isPrimary ? "#86efac" : "#22c55e", price: plan.tp1, priority: isPrimary ? 12 : 22 },
+      { id: `${tf}:tp2`, tf, kind: "tp2", title: formatLevelLabel(tf, "TP2", plan.tp2), color: isPrimary ? "#4ade80" : "#16a34a", price: plan.tp2, priority: isPrimary ? 13 : 23 },
+      { id: `${tf}:tp3`, tf, kind: "tp3", title: formatLevelLabel(tf, "TP3", plan.tp3), color: isPrimary ? "#22c55e" : "#15803d", price: plan.tp3, priority: isPrimary ? 14 : 24 }
+    );
+  }
+
+  const deduped = dedupePriceLevels(levels);
+  for (const level of deduped) {
+    addSetupPriceLine(level.price, { color: level.color, title: level.title });
+  }
+}
+
+function setCombinedChartMarkers() {
+  setSeriesMarkersCompat(OMEGA_CHART.candleSeries, [
+    ...OMEGA_CHART.overlayMarkers,
+    ...OMEGA_CHART.pivotMarkers,
+    ...OMEGA_CHART.emaCrossMarkers,
+    ...OMEGA_CHART.bestAlertMarkers,
+  ]);
+}
+
+function setSeriesMarkersCompat(series, markers) {
+  if (!series) return;
+  if (typeof series.setMarkers === "function") {
+    series.setMarkers(markers);
+    return;
+  }
+  const lw = window.LightweightCharts;
+  if (lw && typeof lw.createSeriesMarkers === "function") {
+    lw.createSeriesMarkers(series, markers);
   }
 }
 
@@ -1375,7 +1914,10 @@ function updateChartHeader(symbol, timeframe, candleCount = null) {
 
   if (title) {
     if (symbol && timeframe) {
-      title.textContent = `${symbol} · ${timeframe.toUpperCase()}`;
+      const symbolState = OMEGA_UI.symbols.get(normalizeSymbol(symbol));
+      title.textContent = `${symbol} · ${timeframe.toUpperCase()} · ${formatPrice(
+        symbolState?.markPrice
+      )}`;
     } else {
       title.textContent = "Omega Chart";
     }
@@ -1435,32 +1977,54 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function formatPrice(value) {
+function trimTrailingZeros(text) {
+  return String(text).replace(/(\.\d*?[1-9])0+$/g, "$1").replace(/\.0+$/g, "").replace(/\.$/g, "");
+}
+
+function formatChartPrice(value) {
   const number = toNumber(value);
-
   if (number === null) return "—";
+  const abs = Math.abs(number);
+  let maximumFractionDigits = 6;
 
-  if (number >= 1000) {
-    return number.toLocaleString("en-US", {
-      maximumFractionDigits: 2,
-    });
-  }
+  if (abs >= 1000) maximumFractionDigits = 0;
+  else if (abs >= 100) maximumFractionDigits = 1;
+  else if (abs >= 10) maximumFractionDigits = 2;
+  else if (abs >= 1) maximumFractionDigits = 4;
 
-  if (number >= 1) {
-    return number.toLocaleString("en-US", {
-      maximumFractionDigits: 4,
-    });
-  }
-
-  if (number >= 0.01) {
-    return number.toLocaleString("en-US", {
-      maximumFractionDigits: 5,
-    });
-  }
-
-  return number.toLocaleString("en-US", {
-    maximumFractionDigits: 8,
+  const rendered = number.toLocaleString("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits,
   });
+  return trimTrailingZeros(rendered);
+}
+
+function formatCompactPrice(value) {
+  return formatChartPrice(value);
+}
+
+function formatLevelLabel(tf, kind, price) {
+  const tfLabel = String(tf || "").toUpperCase();
+  const shortKind = String(kind || "").toUpperCase();
+  const normalizedKind = shortKind === "ENTRY" ? "E" : shortKind;
+  const formattedPrice = formatChartPrice(price);
+  if (formattedPrice === "—") {
+    return `${tfLabel} ${normalizedKind}`.trim();
+  }
+  return `${tfLabel} ${normalizedKind} ${formattedPrice}`.trim();
+}
+
+function getPriceFormatForSymbol(_symbol, referencePrice) {
+  const price = Math.abs(toNumber(referencePrice) ?? 0);
+  if (price >= 1000) return { type: "price", precision: 0, minMove: 1 };
+  if (price >= 100) return { type: "price", precision: 1, minMove: 0.1 };
+  if (price >= 10) return { type: "price", precision: 2, minMove: 0.01 };
+  if (price >= 1) return { type: "price", precision: 4, minMove: 0.0001 };
+  return { type: "price", precision: 6, minMove: 0.000001 };
+}
+
+function formatPrice(value) {
+  return formatCompactPrice(value);
 }
 
 function formatTime(ms) {
@@ -1773,6 +2337,31 @@ function injectOmegaStyles() {
       color: #94a3b8;
     }
 
+    .omega-plan-detail-cta {
+      margin-top: 10px;
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .omega-plan-detail-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(56, 189, 248, .45);
+      border-radius: 10px;
+      background: rgba(14, 165, 233, .15);
+      color: #e0f2fe;
+      font-size: 12px;
+      font-weight: 800;
+      text-decoration: none;
+      padding: 7px 10px;
+    }
+
+    .omega-plan-detail-btn:hover {
+      background: rgba(14, 165, 233, .24);
+      border-color: rgba(56, 189, 248, .7);
+    }
+
     .omega-chart-panel-mounted {
       overflow: hidden !important;
       box-sizing: border-box !important;
@@ -1867,6 +2456,125 @@ function injectOmegaStyles() {
 
     .omega-chart-empty.is-visible {
       display: flex;
+    }
+
+    .omega-active-trades-sidebar {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      width: min(300px, 42%);
+      max-height: calc(100% - 24px);
+      z-index: 8;
+      display: flex;
+      flex-direction: column;
+      background: rgba(2, 6, 23, .9);
+      border: 1px solid rgba(148, 163, 184, .25);
+      border-radius: 12px;
+      box-shadow: 0 12px 28px rgba(0,0,0,.35);
+      overflow: hidden;
+    }
+
+    .omega-active-trades-sidebar.is-collapsed {
+      width: auto;
+      max-height: none;
+    }
+
+    .omega-active-trades-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(148, 163, 184, .16);
+      color: #f8fafc;
+      font-size: 12px;
+    }
+
+    .omega-active-trades-head button {
+      border: 1px solid rgba(148, 163, 184, .35);
+      background: rgba(30, 41, 59, .9);
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 3px 8px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    .omega-active-trades-body {
+      padding: 8px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .omega-active-trade-card {
+      border: 1px solid rgba(148, 163, 184, .2);
+      border-radius: 10px;
+      background: rgba(15, 23, 42, .7);
+      padding: 8px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+
+    .omega-active-trade-card.is-long { border-color: rgba(34, 197, 94, .45); }
+    .omega-active-trade-card.is-short { border-color: rgba(239, 68, 68, .45); }
+    .omega-active-trade-card.is-neutral { border-color: rgba(250, 204, 21, .45); }
+
+    .omega-active-trade-top {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 4px;
+    }
+
+    .omega-active-trade-tf {
+      color: #bae6fd;
+      font-weight: 800;
+      font-size: 10px;
+      letter-spacing: .04em;
+    }
+
+    .omega-active-trade-dir {
+      color: #e2e8f0;
+      font-weight: 700;
+    }
+
+    .omega-active-trade-pill {
+      margin-left: auto;
+      font-size: 10px;
+      border: 1px solid rgba(56, 189, 248, .45);
+      border-radius: 999px;
+      padding: 1px 6px;
+      color: #7dd3fc;
+    }
+
+    .omega-active-trade-status {
+      color: #cbd5e1;
+      margin-bottom: 4px;
+    }
+
+    .omega-active-trade-levels {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 2px 8px;
+      color: #f8fafc;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .omega-active-trade-meta {
+      margin-top: 5px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      color: #94a3b8;
+    }
+
+    .omega-active-trade-meta a {
+      color: #93c5fd;
+      text-decoration: none;
+      font-weight: 700;
     }
 
     .omega-standalone-root {

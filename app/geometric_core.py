@@ -22,6 +22,12 @@ class TrendLine:
     slope: float
     intercept: float | None
     kind: Literal["SUPPORT", "RESISTANCE", "UNKNOWN"]
+    # Metadata opcional para Visual Lab / análisis fractal.
+    # Defaults para no romper llamadas existentes.
+    source_timeframe: str | None = None
+    score: float = 0.0
+    touches: int = 0
+    violations: int = 0
 
 
 @dataclass(slots=True)
@@ -199,12 +205,200 @@ def is_price_near_trendline(price: float, line: TrendLine | None, index: int, to
     return distance_to_trendline_pct(price, line, index) <= max(0.0, tolerance_pct)
 
 
-def estimate_support_resistance_lines(swing_points: list[SwingPoint]) -> tuple[TrendLine | None, TrendLine | None]:
+def _trendline_violation_count(
+    *,
+    line: TrendLine,
+    candles: list[Candle],
+    kind: Literal["SUPPORT", "RESISTANCE"],
+    tolerance_pct: float,
+) -> int:
+    """
+    Cuenta rupturas claras de una TL entre sus puntos de anclaje y la vela actual.
+
+    Importante:
+    - Para SUPPORT usamos cierre bajo la línea como ruptura principal.
+    - Para RESISTANCE usamos cierre sobre la línea como ruptura principal.
+    - Las mechas pueden barrer una TL sin invalidarla; por eso no usamos wick pura
+      como ruptura dura en esta función.
+    """
+    if not candles:
+        return 0
+
+    violations = 0
+    start = max(0, min(line.start.index, line.end.index))
+    end = min(len(candles) - 1, max(line.start.index, line.end.index, len(candles) - 1))
+    tolerance = max(0.0, tolerance_pct) / 100.0
+
+    for index in range(start, end + 1):
+        line_price = trendline_price_at(line, index)
+        if line_price is None or line_price <= 0:
+            continue
+
+        candle = candles[index]
+
+        if kind == "SUPPORT":
+            if candle.close < line_price * (1.0 - tolerance):
+                violations += 1
+        elif kind == "RESISTANCE":
+            if candle.close > line_price * (1.0 + tolerance):
+                violations += 1
+
+    return violations
+
+
+def _trendline_touch_count(
+    *,
+    line: TrendLine,
+    points: list[SwingPoint],
+    tolerance_pct: float,
+) -> int:
+    touches = 0
+    tolerance = max(0.0, tolerance_pct) * 1.35
+
+    for point in points:
+        line_price = trendline_price_at(line, point.index)
+        if line_price is None or line_price <= 0:
+            continue
+        if _pct_distance(point.price, line_price) <= tolerance:
+            touches += 1
+
+    return touches
+
+
+def _select_structural_trendline(
+    *,
+    swing_points: list[SwingPoint],
+    candles: list[Candle],
+    point_kind: Literal["LOW", "HIGH"],
+    bias: Literal["BULLISH", "BEARISH", "NEUTRAL"],
+    tolerance_pct: float,
+) -> TrendLine | None:
+    """
+    Selecciona una TL estructural, no simplemente los últimos dos pivotes.
+
+    Objetivo:
+    - En tendencia alcista, la TL de soporte debe conectar mínimos relevantes.
+    - En tendencia bajista, la TL de resistencia debe conectar máximos relevantes.
+    - Evita micro-swings pegados al precio actual cuando hay una línea dominante mejor.
+    """
+    candidates = [p for p in swing_points if p.kind == point_kind]
+    if len(candidates) < 2:
+        return None
+
+    current_index = len(candles) - 1
+    best_line: TrendLine | None = None
+    best_score = float("-inf")
+    min_span = max(4, min(20, len(candles) // 30))
+
+    for left_idx in range(len(candidates) - 1):
+        for right_idx in range(left_idx + 1, len(candidates)):
+            point_a = candidates[left_idx]
+            point_b = candidates[right_idx]
+            span = point_b.index - point_a.index
+
+            if span < min_span:
+                continue
+
+            if point_kind == "LOW" and bias == "BULLISH" and point_b.price <= point_a.price:
+                continue
+
+            if point_kind == "HIGH" and bias == "BEARISH" and point_b.price >= point_a.price:
+                continue
+
+            line = calculate_trendline(point_a, point_b)
+            line_kind: Literal["SUPPORT", "RESISTANCE"] = "SUPPORT" if point_kind == "LOW" else "RESISTANCE"
+
+            violations = _trendline_violation_count(
+                line=line,
+                candles=candles,
+                kind=line_kind,
+                tolerance_pct=tolerance_pct,
+            )
+
+            touches = _trendline_touch_count(
+                line=line,
+                points=candidates,
+                tolerance_pct=tolerance_pct,
+            )
+
+            avg_strength = (point_a.strength + point_b.strength) / 2.0
+            recency = point_b.index / max(1, current_index)
+            projected_now = trendline_price_at(line, current_index)
+            distance_now = (
+                _pct_distance(candles[-1].close, projected_now)
+                if projected_now is not None and projected_now > 0 and candles[-1].close > 0
+                else 999.0
+            )
+
+            score = 0.0
+            score += min(span, 180) * 0.20
+            score += touches * 18.0
+            score += avg_strength * 0.35
+            score += recency * 10.0
+            score -= violations * 18.0
+
+            # Una TL útil para trading debe seguir teniendo relación con el precio actual.
+            if distance_now <= tolerance_pct * 2.0:
+                score += 16.0
+            elif distance_now > 4.0:
+                score -= 12.0
+
+            # Preferencia direccional suave.
+            if line_kind == "SUPPORT" and line.slope > 0:
+                score += 8.0
+            if line_kind == "RESISTANCE" and line.slope < 0:
+                score += 8.0
+
+            if score > best_score:
+                line.score = float(score)
+                line.touches = int(touches)
+                line.violations = int(violations)
+                best_score = score
+                best_line = line
+
+    if best_line is not None:
+        return best_line
+
+    # Fallback defensivo: preserva el comportamiento anterior si no hay candidato mejor.
+    return calculate_trendline(candidates[-2], candidates[-1])
+
+
+def estimate_support_resistance_lines(
+    swing_points: list[SwingPoint],
+    candles: list[Candle] | None = None,
+    bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = "NEUTRAL",
+    tolerance_pct: float = 0.5,
+) -> tuple[TrendLine | None, TrendLine | None]:
+    """
+    Estima TLs de soporte/resistencia.
+
+    Compatibilidad:
+    - Si se llama solo con swing_points, conserva el comportamiento antiguo:
+      últimos 2 lows y últimos 2 highs.
+    - Si se pasan candles/bias/tolerance_pct, selecciona TL estructural por score.
+    """
     lows = [p for p in swing_points if p.kind == "LOW"]
     highs = [p for p in swing_points if p.kind == "HIGH"]
 
-    support = calculate_trendline(lows[-2], lows[-1]) if len(lows) >= 2 else None
-    resistance = calculate_trendline(highs[-2], highs[-1]) if len(highs) >= 2 else None
+    if candles is None or len(candles) < 5:
+        support = calculate_trendline(lows[-2], lows[-1]) if len(lows) >= 2 else None
+        resistance = calculate_trendline(highs[-2], highs[-1]) if len(highs) >= 2 else None
+        return support, resistance
+
+    support = _select_structural_trendline(
+        swing_points=swing_points,
+        candles=candles,
+        point_kind="LOW",
+        bias=bias,
+        tolerance_pct=tolerance_pct,
+    )
+    resistance = _select_structural_trendline(
+        swing_points=swing_points,
+        candles=candles,
+        point_kind="HIGH",
+        bias=bias,
+        tolerance_pct=tolerance_pct,
+    )
     return support, resistance
 
 
@@ -768,10 +962,15 @@ def analyze_geometry(candles: list[Candle], source_timeframe: str | None = None)
     elif has_lower_highs and has_lower_lows:
         bias = "BEARISH"
 
-    support, resistance = estimate_support_resistance_lines(points)
     current_price = candles[-1].close
     current_index = len(candles) - 1
     tolerance_pct = calculate_dynamic_tolerance_pct(candles, fallback_pct=0.5)
+    support, resistance = estimate_support_resistance_lines(
+        swing_points=points,
+        candles=candles,
+        bias=bias,
+        tolerance_pct=tolerance_pct,
+    )
 
     zones = build_geometry_zones(points, candles, tolerance_pct)
     detected_patterns = detect_geometry_patterns(
@@ -788,6 +987,12 @@ def analyze_geometry(candles: list[Candle], source_timeframe: str | None = None)
     for pattern in detected_patterns:
         if source_timeframe:
             pattern.source_timeframe = source_timeframe
+
+    if source_timeframe:
+        if support is not None:
+            support.source_timeframe = source_timeframe
+        if resistance is not None:
+            resistance.source_timeframe = source_timeframe
 
     score = score_geometry_quality(
         bias,
@@ -810,3 +1015,4 @@ def analyze_geometry(candles: list[Candle], source_timeframe: str | None = None)
         patterns=detected_patterns,
         reason=reason,
     )
+

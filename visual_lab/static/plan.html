@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Omega Plan Detail</title>
+    <style>
+      body { margin: 0; font-family: Inter, system-ui, sans-serif; background:#020617; color:#e2e8f0; }
+      .wrap { max-width: 980px; margin: 0 auto; padding: 18px; }
+      .head { margin-bottom: 14px; }
+      .title { font-size: 20px; font-weight: 900; color: #f8fafc; }
+      .sub { color: #94a3b8; font-size: 13px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap: 12px; }
+      .card { border:1px solid rgba(148,163,184,.2); border-radius: 12px; background: rgba(15,23,42,.72); padding: 12px; }
+      .card h3 { margin: 0 0 8px; font-size: 14px; color:#f8fafc; }
+      .kv { display:flex; justify-content:space-between; gap:10px; padding: 3px 0; border-bottom:1px solid rgba(148,163,184,.1); font-size:12px; }
+      .kv span { color:#94a3b8; }
+      .mono { font-variant-numeric: tabular-nums; }
+      .timeline li { margin: 5px 0; font-size:12px; color:#cbd5e1; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="head">
+        <div class="title" id="planTitle">Plan detail</div>
+        <div class="sub" id="planSub">Esperando datos...</div>
+      </div>
+      <div class="grid" id="planGrid"></div>
+    </div>
+    <script src="/static/plan_detail.js"></script>
+  </body>
+</html>

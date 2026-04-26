@@ -37,6 +37,7 @@ const OMEGA_UI = {
 
   connectedAt: null,
   lastServerMessageAt: null,
+  lastEventType: null,
   lastStatus: null,
 
   symbols: new Map(),
@@ -52,6 +53,7 @@ const OMEGA_CHART = {
 
   selectedSymbol: null,
   selectedTf: "15m",
+  lastSetDataKey: null,
 
   candles: new Map(),
 };
@@ -275,6 +277,8 @@ function sendWs(payload) {
  * ============================================================ */
 
 function handleBackendMessage(message) {
+  OMEGA_UI.lastEventType = message?.type || "unknown";
+
   switch (message.type) {
     case "hello":
       handleHello(message);
@@ -284,8 +288,14 @@ function handleBackendMessage(message) {
       handleStatus(message.data || message.status || message);
       break;
 
+    case "bootstrap_state":
+    case "state_sync":
+      applyBootstrapState(message.data || message);
+      break;
+
     case "snapshot":
-      applySnapshot(message.data || message);
+      // Deprecated compat legacy: server.py ya no debe enviar "snapshot".
+      applyBootstrapState(message.data || message);
       break;
 
     case "market_batch":
@@ -294,6 +304,10 @@ function handleBackendMessage(message) {
 
     case "scanner_alert":
       applyScannerAlert(message.data || message);
+      break;
+
+    case "system":
+      applySystemEvent(message);
       break;
 
     case "pong":
@@ -364,13 +378,13 @@ function applyMarketBatch(message) {
 }
 
 /* ============================================================
- * Snapshot WS inicial
+ * Bootstrap / state sync inicial por WS
  * ============================================================ */
 
-function applySnapshot(payload) {
+function applyBootstrapState(payload) {
   /**
-   * Esto NO es snapshot REST ni polling.
-   * Es hidratación inicial por WebSocket desde server.py.
+   * Esto NO es polling REST.
+   * Es bootstrap inicial (state sync) por WebSocket desde server.py.
    */
 
   const data = payload.data || payload;
@@ -412,6 +426,10 @@ function applySnapshot(payload) {
         }
 
         setChartCandles(symbol, tf, candles);
+        const latest = candles[candles.length - 1];
+        if (latest) {
+          state.klines.set(tf, latest);
+        }
       }
     }
   }
@@ -569,10 +587,10 @@ function mountVisualSlots() {
 }
 
 function mountWatchlistPanel() {
-  const panel = findWatchlistPanel();
+  const panel = document.querySelector("#watchlist");
 
   if (!panel) {
-    mountStandaloneFallback();
+    console.warn("[Omega UI] No existe #watchlist en index.html");
     return;
   }
 
@@ -627,23 +645,9 @@ function mountWatchlistPanel() {
 }
 
 function mountRightPanels() {
-  const decision = findPanelByTitle("DECISIÓN DEL SCANNER", {
-    minWidth: 180,
-    maxWidth: 520,
-    minHeight: 40,
-  });
-
-  const geometry = findPanelByTitle("GEOMETRÍA M15", {
-    minWidth: 180,
-    maxWidth: 520,
-    minHeight: 40,
-  });
-
-  const plan = findPanelByTitle("PLAN", {
-    minWidth: 180,
-    maxWidth: 520,
-    minHeight: 40,
-  });
+  const decision = document.querySelector("#scannerDecisionPanel");
+  const geometry = document.querySelector("#geometryM15Panel");
+  const plan = document.querySelector("#planPanel");
 
   if (decision && !decision.querySelector("#omegaDecisionBody")) {
     decision.insertAdjacentHTML(
@@ -673,10 +677,10 @@ function mountChartPanel() {
     return OMEGA_CHART.container;
   }
 
-  const panel = findMainChartPanel();
+  const panel = document.querySelector("#chart");
 
   if (!panel) {
-    console.warn("[Omega Chart] No encontré panel central para montar el gráfico.");
+    console.warn("[Omega Chart] No existe #chart en index.html.");
     return null;
   }
 
@@ -721,149 +725,6 @@ function mountChartPanel() {
   return OMEGA_CHART.container;
 }
 
-function mountStandaloneFallback() {
-  if (document.querySelector("#omegaStandaloneRoot")) return;
-
-  const root = document.createElement("div");
-  root.id = "omegaStandaloneRoot";
-  root.className = "omega-standalone-root";
-
-  root.innerHTML = `
-    <div class="omega-watchlist-head">
-      <div>
-        <div class="omega-panel-label">OMEGA VISUAL LAB</div>
-        <div class="omega-title">Omega Realtime</div>
-        <div class="omega-subtitle">Market Hub · Backend WS</div>
-      </div>
-
-      <div id="omegaConnectionDot" class="omega-conn-dot is-connecting"></div>
-    </div>
-
-    <div id="omegaConnectionText" class="omega-connection-text">
-      Conectando…
-    </div>
-
-    <div class="omega-actions">
-      <button id="omegaReconnectBtn" type="button">Reconectar</button>
-      <button id="omegaStopBtn" type="button">Detener</button>
-    </div>
-
-    <div id="omegaWatchlistRows" class="omega-watchlist-rows"></div>
-  `;
-
-  document.body.appendChild(root);
-}
-
-/* ============================================================
- * Selectores defensivos de layout
- * ============================================================ */
-
-function findWatchlistPanel() {
-  return (
-    document.querySelector("#watchlist") ||
-    document.querySelector("#watchlistPanel") ||
-    document.querySelector("[data-panel='watchlist']") ||
-    document.querySelector("[data-slot='watchlist']") ||
-    document.querySelector(".watchlist-panel") ||
-    document.querySelector(".watchlist") ||
-    findPanelByTitle("WATCHLIST", {
-      minWidth: 120,
-      maxWidth: 360,
-      minHeight: 120,
-    })
-  );
-}
-
-function findMainChartPanel() {
-  return (
-    document.querySelector("#chart") ||
-    document.querySelector("#chartContainer") ||
-    document.querySelector("#omegaChart") ||
-    document.querySelector("[data-panel='chart']") ||
-    document.querySelector("[data-slot='chart']") ||
-    document.querySelector(".chart-panel") ||
-    document.querySelector(".main-chart") ||
-    document.querySelector(".visual-chart") ||
-    findLargestEmptyPanel()
-  );
-}
-
-function findPanelByTitle(title, options = {}) {
-  const wanted = normalizeText(title);
-
-  const minWidth = options.minWidth ?? 0;
-  const maxWidth = options.maxWidth ?? Infinity;
-  const minHeight = options.minHeight ?? 0;
-  const maxHeight = options.maxHeight ?? Infinity;
-
-  const candidates = Array.from(
-    document.querySelectorAll("aside, section, article, div")
-  );
-
-  let best = null;
-  let bestArea = Infinity;
-
-  for (const element of candidates) {
-    if (element.id && element.id.startsWith("omega")) continue;
-
-    const rect = element.getBoundingClientRect();
-
-    if (rect.width < minWidth || rect.width > maxWidth) continue;
-    if (rect.height < minHeight || rect.height > maxHeight) continue;
-
-    const text = normalizeText(element.textContent || "");
-    if (!text.includes(wanted)) continue;
-
-    const area = rect.width * rect.height;
-
-    if (area < bestArea) {
-      best = element;
-      bestArea = area;
-    }
-  }
-
-  return best;
-}
-
-function findLargestEmptyPanel() {
-  const candidates = Array.from(
-    document.querySelectorAll("section, article, div, main")
-  );
-
-  let best = null;
-  let bestArea = 0;
-
-  for (const element of candidates) {
-    if (element.id && element.id.startsWith("omega")) continue;
-    if (element.closest("#omegaStandaloneRoot")) continue;
-    if (element.querySelector("#omegaWatchlistRows")) continue;
-    if (element.querySelector("#omegaDecisionBody")) continue;
-    if (element.querySelector("#omegaGeometryBody")) continue;
-    if (element.querySelector("#omegaPlanBody")) continue;
-
-    const rect = element.getBoundingClientRect();
-
-    if (rect.width < 420 || rect.height < 260) continue;
-
-    const text = String(element.textContent || "").trim();
-
-    /**
-     * Buscamos el panel central vacío. Si tiene mucho texto,
-     * probablemente es un contenedor padre y no el chart panel real.
-     */
-    if (text.length > 120) continue;
-
-    const area = rect.width * rect.height;
-
-    if (area > bestArea) {
-      best = element;
-      bestArea = area;
-    }
-  }
-
-  return best;
-}
-
 function hookExternalTimeframeButtons() {
   /**
    * Si la plantilla externa ya tiene botones arriba:
@@ -871,28 +732,19 @@ function hookExternalTimeframeButtons() {
    * los usamos también.
    */
 
-  const buttons = Array.from(document.querySelectorAll("button"));
+  const buttons = Array.from(document.querySelectorAll("[data-chart-tf]"));
 
   for (const button of buttons) {
-    const tf = parseTfFromText(button.textContent || "");
+    if (button.dataset.omegaTfBound === "1") continue;
+    const tf = String(button.getAttribute("data-chart-tf") || "").toLowerCase();
 
-    if (!tf) continue;
+    if (!OMEGA_CONFIG.tfOrder.includes(tf)) continue;
 
     button.addEventListener("click", () => {
       selectChartTf(tf);
     });
+    button.dataset.omegaTfBound = "1";
   }
-}
-
-function parseTfFromText(text) {
-  const normalized = normalizeText(text);
-
-  if (normalized.includes("M15")) return "15m";
-  if (normalized.includes("M5")) return "5m";
-  if (normalized.includes("M3")) return "3m";
-  if (normalized.includes("M1")) return "1m";
-
-  return null;
 }
 
 function normalizeText(value) {
@@ -996,19 +848,22 @@ function renderScannerPanels() {
     if (!latest) {
       decision.innerHTML = `<span class="omega-muted">Sin alertas todavía.</span>`;
     } else {
+      const blockers = Array.isArray(latest.blockers)
+        ? latest.blockers.join(", ")
+        : "—";
+      const degraders = Array.isArray(latest.degraders)
+        ? latest.degraders.join(", ")
+        : "—";
       decision.innerHTML = `
-        <div class="omega-decision-main">
-          ${escapeHtml(latest.side || "—")} · ${escapeHtml(latest.symbol || "—")}
-        </div>
-
-        <div class="omega-decision-sub">
-          ${escapeHtml(latest.type || latest.signal_type || "Señal")} ·
-          Calidad: ${escapeHtml(latest.quality || latest.calidad || "—")}
-        </div>
-
-        <div class="omega-decision-reason">
-          ${escapeHtml(latest.reason || latest.motivo || "Sin motivo detallado.")}
-        </div>
+        <div class="omega-kv"><span>Resultado</span><strong>${escapeHtml(latest.result || latest.side || "—")}</strong></div>
+        <div class="omega-kv"><span>Tipo</span><strong>${escapeHtml(latest.type || latest.signal_type || "—")}</strong></div>
+        <div class="omega-kv"><span>Calidad</span><strong>${escapeHtml(latest.quality || latest.calidad || "—")}</strong></div>
+        <div class="omega-kv"><span>Alert allowed</span><strong>${escapeHtml(String(latest.alert_allowed ?? "—"))}</strong></div>
+        <div class="omega-kv"><span>Geometry score</span><strong>${escapeHtml(latest.geometry_score ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Indicator score</span><strong>${escapeHtml(latest.indicator_score ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Total score</span><strong>${escapeHtml(latest.total_score ?? latest.score ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Blockers</span><strong>${escapeHtml(blockers)}</strong></div>
+        <div class="omega-kv"><span>Degraders</span><strong>${escapeHtml(degraders)}</strong></div>
       `;
     }
   }
@@ -1018,25 +873,12 @@ function renderScannerPanels() {
       geometry.innerHTML = `<span class="omega-muted">Esperando estructura M15.</span>`;
     } else {
       geometry.innerHTML = `
-        <div class="omega-kv">
-          <span>Símbolo</span>
-          <strong>${escapeHtml(latest.symbol || "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Fuente</span>
-          <strong>${escapeHtml(latest.source_tf || latest.timeframe || "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Geometría</span>
-          <strong>${escapeHtml(latest.geometry_score ?? "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Total</span>
-          <strong>${escapeHtml(latest.total_score ?? latest.score ?? "—")}</strong>
-        </div>
+        <div class="omega-kv"><span>Bias</span><strong>${escapeHtml(latest.bias || latest.geometry_bias || "—")}</strong></div>
+        <div class="omega-kv"><span>Confianza</span><strong>${escapeHtml(latest.confidence ?? latest.confidence_score ?? "—")}</strong></div>
+        <div class="omega-kv"><span>BOS</span><strong>${escapeHtml(latest.bos ?? "—")}</strong></div>
+        <div class="omega-kv"><span>CHoCH</span><strong>${escapeHtml(latest.choch ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Pullback</span><strong>${escapeHtml(latest.pullback ?? "—")}</strong></div>
+        <div class="omega-kv"><span>Estructura madre</span><strong>${escapeHtml(latest.mother_structure ?? latest.structure ?? "—")}</strong></div>
       `;
     }
   }
@@ -1045,26 +887,16 @@ function renderScannerPanels() {
     if (!latest) {
       plan.innerHTML = `<span class="omega-muted">Sin plan activo.</span>`;
     } else {
+      const tps = Array.isArray(latest.tps || latest.take_profits)
+        ? (latest.tps || latest.take_profits).join(", ")
+        : "—";
       plan.innerHTML = `
-        <div class="omega-kv">
-          <span>Precio</span>
-          <strong>${formatPrice(latest.price)}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Tipo</span>
-          <strong>${escapeHtml(latest.type || latest.signal_type || "—")}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>ID</span>
-          <strong>${escapeHtml(String(latest.fingerprint || latest.plan_id || "—").slice(0, 14))}</strong>
-        </div>
-
-        <div class="omega-kv">
-          <span>Hora</span>
-          <strong>${formatTime(latest.server_time_ms || latest.receivedAt)}</strong>
-        </div>
+        <div class="omega-kv"><span>Estado</span><strong>${escapeHtml(latest.plan_status || latest.status || "—")}</strong></div>
+        <div class="omega-kv"><span>Entry</span><strong>${formatPrice(latest.entry ?? latest.price)}</strong></div>
+        <div class="omega-kv"><span>SL</span><strong>${formatPrice(latest.sl ?? latest.stop_loss)}</strong></div>
+        <div class="omega-kv"><span>TPs</span><strong>${escapeHtml(tps)}</strong></div>
+        <div class="omega-kv"><span>Plan ID</span><strong>${escapeHtml(String(latest.fingerprint || latest.plan_id || "—").slice(0, 24))}</strong></div>
+        <div class="omega-kv"><span>No plan reason</span><strong>${escapeHtml(latest.no_plan_reason || latest.reason || latest.motivo || "—")}</strong></div>
       `;
     }
   }
@@ -1084,6 +916,23 @@ function renderConnectionMeta() {
     : "Binance…";
 
   text.textContent = `${count} símbolos · ${binanceState} · Último evento: ${last}`;
+
+  const wsStatus = document.querySelector("#workspaceStatus");
+  if (wsStatus) {
+    const candleCount = getSelectedCandleCount();
+    wsStatus.textContent = `Backend ${
+      OMEGA_UI.ws?.readyState === WebSocket.OPEN ? "conectado" : "desconectado"
+    } · Evento ${OMEGA_UI.lastEventType || "—"} · Velas ${candleCount}`;
+  }
+}
+
+function getSelectedCandleCount() {
+  if (!OMEGA_CHART.selectedSymbol || !OMEGA_CHART.selectedTf) return 0;
+  return (
+    OMEGA_CHART.candles.get(
+      candleKey(OMEGA_CHART.selectedSymbol, OMEGA_CHART.selectedTf)
+    ) || []
+  ).length;
 }
 
 function setConnectionState(kind, label) {
@@ -1109,9 +958,11 @@ function candleKey(symbol, timeframe) {
 
 function setChartCandles(symbol, timeframe, candles) {
   const key = candleKey(symbol, timeframe);
-
-  const cleaned = candles
-    .filter(isValidChartCandle)
+  const byTime = new Map();
+  for (const candle of candles.filter(isValidChartCandle)) {
+    byTime.set(candle.time, candle);
+  }
+  const cleaned = Array.from(byTime.values())
     .sort((a, b) => a.time - b.time)
     .slice(-OMEGA_CONFIG.maxCandlesPerKey);
 
@@ -1342,10 +1193,15 @@ function renderSelectedChart() {
 
   try {
     OMEGA_CHART.candleSeries.setData(chartData);
+    const dataKey = `${key}::${chartData.length}`;
 
-    if (OMEGA_CHART.chart.timeScale) {
+    if (
+      OMEGA_CHART.chart.timeScale &&
+      OMEGA_CHART.lastSetDataKey !== dataKey
+    ) {
       OMEGA_CHART.chart.timeScale().fitContent();
     }
+    OMEGA_CHART.lastSetDataKey = dataKey;
   } catch (err) {
     console.error("[Omega Chart] Error seteando datos:", err);
     showChartEmpty(`Error seteando datos del chart: ${err.message || err}`);
@@ -1375,7 +1231,10 @@ function updateChartHeader(symbol, timeframe, candleCount = null) {
 
   if (title) {
     if (symbol && timeframe) {
-      title.textContent = `${symbol} · ${timeframe.toUpperCase()}`;
+      const symbolState = OMEGA_UI.symbols.get(normalizeSymbol(symbol));
+      title.textContent = `${symbol} · ${timeframe.toUpperCase()} · ${formatPrice(
+        symbolState?.markPrice
+      )}`;
     } else {
       title.textContent = "Omega Chart";
     }

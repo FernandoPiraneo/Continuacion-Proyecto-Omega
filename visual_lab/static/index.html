@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  />
+
+  <meta name="theme-color" content="#020617" />
+
+  <title>Omega Visual Lab</title>
+
+  <!--
+    Omega Visual Lab
+    Arquitectura producción:
+
+      server.py
+        ↓
+      /ws/dashboard
+        ↓
+      app.js
+        ↓
+      UI + Lightweight Charts
+
+    Importante:
+    - index.html solo define la plantilla visual.
+    - app.js monta datos vivos dentro de los slots.
+    - La UI NO conecta directo a Binance.
+  -->
+
+  <style>
+    :root {
+      --bg-main: #020617;
+      --bg-panel: #0f172a;
+      --bg-panel-soft: #111827;
+      --bg-panel-deep: #020617;
+
+      --border-soft: rgba(148, 163, 184, 0.16);
+      --border-strong: rgba(56, 189, 248, 0.35);
+
+      --text-main: #f8fafc;
+      --text-soft: #cbd5e1;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+
+      --accent: #38bdf8;
+      --accent-soft: rgba(56, 189, 248, 0.14);
+
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #f59e0b;
+
+      --radius-lg: 18px;
+      --radius-md: 14px;
+      --radius-sm: 10px;
+
+      --sidebar-width: 270px;
+      --rightbar-width: 380px;
+
+      --topbar-height: 70px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      min-height: 100%;
+      margin: 0;
+      background: var(--bg-main);
+      color: var(--text-main);
+      font-family:
+        Inter,
+        ui-sans-serif,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Roboto,
+        Arial,
+        sans-serif;
+      overflow: hidden;
+    }
+
+    body {
+      min-height: 100vh;
+    }
+
+    button,
+    input,
+    select,
+    textarea {
+      font: inherit;
+    }
+
+    button {
+      user-select: none;
+    }
+
+    .app-shell {
+      width: 100vw;
+      height: 100vh;
+      display: grid;
+      grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+      background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.08), transparent 28rem),
+        radial-gradient(circle at bottom right, rgba(34, 197, 94, 0.05), transparent 30rem),
+        var(--bg-main);
+    }
+
+    .sidebar {
+      min-width: 0;
+      height: 100vh;
+      border-right: 1px solid var(--border-soft);
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(2, 6, 23, 0.98)),
+        var(--bg-panel-deep);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .brand {
+      padding: 16px 14px 12px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    }
+
+    .brand-title {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.15;
+      letter-spacing: -0.04em;
+      font-weight: 900;
+      color: var(--text-main);
+    }
+
+    .brand-subtitle {
+      margin-top: 4px;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .watchlist-card {
+      margin: 14px;
+      padding: 14px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-lg);
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(15, 23, 42, 0.78)),
+        var(--bg-panel);
+      min-height: 0;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .main-shell {
+      min-width: 0;
+      height: 100vh;
+      display: grid;
+      grid-template-rows: var(--topbar-height) minmax(0, 1fr);
+      overflow: hidden;
+    }
+
+    .topbar {
+      min-width: 0;
+      padding: 14px 14px 10px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    }
+
+    .topbar-copy {
+      min-width: 0;
+    }
+
+    .workspace-title {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.2;
+      letter-spacing: -0.03em;
+      color: var(--text-main);
+      font-weight: 900;
+    }
+
+    .workspace-subtitle {
+      margin-top: 4px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    .workspace-status {
+      margin-top: 8px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    .global-tf-bar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+      flex: 0 0 auto;
+    }
+
+    .tf-button {
+      cursor: pointer;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      color: #dbeafe;
+      background: rgba(15, 23, 42, 0.82);
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 800;
+      transition:
+        border-color 0.15s ease,
+        background 0.15s ease,
+        transform 0.15s ease;
+    }
+
+    .tf-button:hover {
+      border-color: rgba(56, 189, 248, 0.55);
+      background: rgba(14, 165, 233, 0.14);
+    }
+
+    .tf-button.is-primary {
+      border-color: rgba(56, 189, 248, 0.8);
+      background: rgba(14, 165, 233, 0.18);
+    }
+
+    .content-grid {
+      min-width: 0;
+      min-height: 0;
+      padding: 14px;
+      display: grid;
+      grid-template-columns: minmax(420px, 1fr) var(--rightbar-width);
+      gap: 12px;
+      overflow: hidden;
+    }
+
+    .chart-card {
+      min-width: 0;
+      min-height: 0;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-lg);
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.78)),
+        var(--bg-panel);
+      overflow: hidden;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.18);
+    }
+
+    .rightbar {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow: hidden;
+    }
+
+    .info-card {
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-md);
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.76)),
+        var(--bg-panel);
+      min-height: 88px;
+      padding: 14px;
+      overflow: hidden;
+    }
+
+    .info-card-title {
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      color: #dbeafe;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .info-card-body {
+      margin-top: 10px;
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .info-card.is-flex {
+      flex: 1;
+      min-height: 120px;
+    }
+
+    .footer-debug {
+      margin-top: auto;
+      padding: 10px 14px;
+      border-top: 1px solid rgba(148, 163, 184, 0.08);
+      color: var(--text-dim);
+      font-size: 11px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .loading-note {
+      width: 100%;
+      height: 100%;
+      min-height: 420px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 13px;
+      text-align: center;
+      padding: 24px;
+    }
+
+    .noscript-warning {
+      margin: 14px;
+      padding: 14px;
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      background: rgba(127, 29, 29, 0.2);
+      color: #fecaca;
+      border-radius: var(--radius-md);
+      font-size: 13px;
+    }
+
+    @media (max-width: 1180px) {
+      :root {
+        --sidebar-width: 260px;
+        --rightbar-width: 330px;
+      }
+
+      .content-grid {
+        grid-template-columns: minmax(360px, 1fr) var(--rightbar-width);
+      }
+    }
+
+    @media (max-width: 980px) {
+      html,
+      body {
+        overflow: auto;
+      }
+
+      .app-shell {
+        height: auto;
+        min-height: 100vh;
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        height: auto;
+        min-height: 360px;
+        border-right: none;
+        border-bottom: 1px solid var(--border-soft);
+      }
+
+      .watchlist-card {
+        max-height: 460px;
+      }
+
+      .main-shell {
+        height: auto;
+      }
+
+      .content-grid {
+        grid-template-columns: 1fr;
+        overflow: visible;
+      }
+
+      .chart-card {
+        min-height: 520px;
+      }
+
+      .rightbar {
+        overflow: visible;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .topbar {
+        height: auto;
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .global-tf-bar {
+        justify-content: flex-start;
+      }
+
+      .content-grid {
+        padding: 10px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <noscript>
+    <div class="noscript-warning">
+      Omega Visual Lab necesita JavaScript habilitado para conectarse al Market Hub.
+    </div>
+  </noscript>
+
+  <div class="app-shell">
+    <!-- =====================================================
+      SIDEBAR / WATCHLIST SLOT
+      app.js detecta #watchlist y monta aquí la watchlist viva.
+    ====================================================== -->
+    <aside class="sidebar">
+      <header class="brand">
+        <h1 class="brand-title">Ω Omega Visual Lab</h1>
+        <div class="brand-subtitle">Scanner Visual Debugger</div>
+      </header>
+
+      <section
+        id="watchlist"
+        class="watchlist-card"
+        data-panel="watchlist"
+        aria-label="Watchlist"
+      >
+        <div class="loading-note">
+          Cargando watchlist realtime…
+        </div>
+      </section>
+
+      <footer class="footer-debug">
+        <span>Market Hub</span>
+        <span>Read-only</span>
+      </footer>
+    </aside>
+
+    <!-- =====================================================
+      MAIN WORKSPACE
+    ====================================================== -->
+    <main class="main-shell">
+      <header class="topbar">
+        <div class="topbar-copy">
+          <h2 class="workspace-title">---</h2>
+          <div class="workspace-subtitle">Plantilla externa · solo lectura</div>
+          <div class="workspace-status" id="workspaceStatus">
+            Sin plan activo.
+          </div>
+        </div>
+
+        <nav class="global-tf-bar" aria-label="Timeframes">
+          <button class="tf-button is-primary" type="button" data-chart-tf="15m">
+            M15 Madre
+          </button>
+          <button class="tf-button" type="button" data-chart-tf="5m">
+            M5
+          </button>
+          <button class="tf-button" type="button" data-chart-tf="3m">
+            M3
+          </button>
+          <button class="tf-button" type="button" data-chart-tf="1m">
+            M1 Gatillo
+          </button>
+        </nav>
+      </header>
+
+      <section class="content-grid">
+        <!-- =================================================
+          CHART SLOT
+          app.js detecta #chart y monta aquí Lightweight Charts.
+        ================================================== -->
+        <section
+          id="chart"
+          class="chart-card"
+          data-panel="chart"
+          aria-label="Chart"
+        >
+          <div class="loading-note">
+            Preparando gráfico OHLC…
+          </div>
+        </section>
+
+        <!-- =================================================
+          RIGHT PANELS
+          app.js detecta los títulos y agrega cuerpos dinámicos.
+        ================================================== -->
+        <aside class="rightbar">
+          <section
+            id="scannerDecisionPanel"
+            class="info-card"
+            data-panel="scanner-decision"
+          >
+            <h3 class="info-card-title">DECISIÓN DEL SCANNER</h3>
+          </section>
+
+          <section
+            id="geometryM15Panel"
+            class="info-card"
+            data-panel="geometry-m15"
+          >
+            <h3 class="info-card-title">GEOMETRÍA M15</h3>
+            <div class="info-card-body">
+              Esperando estructura M15.
+            </div>
+          </section>
+
+          <section
+            id="planPanel"
+            class="info-card is-flex"
+            data-panel="plan"
+          >
+            <h3 class="info-card-title">PLAN</h3>
+          </section>
+        </aside>
+      </section>
+    </main>
+  </div>
+
+  <!--
+    Lightweight Charts.
+
+    Versión fijada:
+    - Usamos v4.2.3 para mantener compatibilidad directa con:
+      chart.addCandlestickSeries()
+
+    app.js igualmente tiene compatibilidad defensiva con v5 mediante:
+      chart.addSeries(LightweightCharts.CandlestickSeries)
+  -->
+  <script
+    src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"
+    defer
+  ></script>
+
+  <!--
+    App principal.
+    Debe cargar después de Lightweight Charts.
+  -->
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

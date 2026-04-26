@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
 import uvicorn
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -42,6 +43,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 BINANCE_MARKET_WS_BASE = "wss://fstream.binance.com/market/stream?streams="
+BINANCE_FUTURES_REST_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 
 DEFAULT_WATCHLIST = [
     "ADAUSDT",
@@ -69,7 +71,14 @@ DEFAULT_WATCHLIST = [
 
 DEFAULT_TIMEFRAMES = ["1m", "3m", "5m", "15m"]
 
-MAX_CANDLES_PER_TF = int(os.getenv("OMEGA_MAX_CANDLES_PER_TF", "500"))
+MAX_CANDLES_PER_TF = int(os.getenv("OMEGA_MAX_CANDLES_PER_TF", "1500"))
+BACKFILL_ENABLED = os.getenv("OMEGA_ENABLE_BACKFILL", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+BACKFILL_LIMIT = int(os.getenv("OMEGA_BACKFILL_LIMIT", "1500"))
 
 BROADCAST_INTERVAL_SECONDS = float(os.getenv("OMEGA_BROADCAST_INTERVAL_SECONDS", "0.25"))
 
@@ -81,7 +90,7 @@ SCANNER_ENABLED = os.getenv("OMEGA_ENABLE_SCANNER", "0").strip().lower() in {
 }
 
 SCANNER_INTERVAL_SECONDS = float(os.getenv("OMEGA_SCANNER_INTERVAL_SECONDS", "1.0"))
-SCANNER_MODULE = os.getenv("OMEGA_SCANNER_MODULE", "app.scanner")
+SCANNER_MODULE = os.getenv("OMEGA_SCANNER_MODULE", "visual_lab.scanner_adapter")
 SCANNER_FUNCTION = os.getenv("OMEGA_SCANNER_FUNCTION", "scan_realtime_state")
 
 NOTIFIER_ENABLED = os.getenv("OMEGA_ENABLE_NOTIFIER", "0").strip().lower() in {
@@ -308,7 +317,7 @@ class MarketCache:
 
         return candle
 
-    async def snapshot(self) -> dict[str, Any]:
+    async def export_state(self) -> dict[str, Any]:
         async with self._lock:
             symbols: dict[str, Any] = {}
 
@@ -335,13 +344,47 @@ class MarketCache:
                 }
 
         return {
-            "type": "snapshot",
+            "type": "bootstrap_state",
             "source": "omega_market_cache",
             "generated_at_ms": now_ms(),
             "symbols": symbols,
             "watchlist": self.symbols,
             "timeframes": self.timeframes,
         }
+
+    async def seed_klines(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        candles: list[dict[str, Any]],
+    ) -> int:
+        normalized_symbol = normalize_symbol(symbol)
+        tf = str(timeframe or "").lower()
+
+        if normalized_symbol not in self._state or tf not in self.timeframes:
+            return 0
+
+        valid = [
+            candle
+            for candle in candles
+            if candle.get("open_time") is not None
+        ]
+
+        valid.sort(key=lambda item: int(item.get("open_time") or 0))
+        valid = valid[-MAX_CANDLES_PER_TF:]
+
+        async with self._lock:
+            tf_state = self._state[normalized_symbol]["klines"][tf]
+            closed: deque[dict[str, Any]] = tf_state["closed"]
+            closed.clear()
+
+            for candle in valid:
+                closed.append(candle)
+
+            tf_state["current"] = valid[-1] if valid else None
+
+        return len(valid)
 
     async def scanner_payload(self) -> dict[str, Any]:
         """
@@ -362,7 +405,7 @@ class MarketCache:
         }
         """
 
-        snap = await self.snapshot()
+        snap = await self.export_state()
         out_symbols: dict[str, Any] = {}
 
         for symbol, item in snap["symbols"].items():
@@ -512,6 +555,11 @@ def alert_fingerprint(alert: dict[str, Any]) -> str:
     if explicit:
         return str(explicit)
 
+    if str(alert.get("type", "")).lower() == "visual_state":
+        symbol = str(alert.get("symbol", "unknown")).upper()
+        generated = str(alert.get("generated_at_ms") or alert.get("server_time_ms") or now_ms())
+        return f"visual_state::{symbol}::{generated}"
+
     core = {
         "symbol": alert.get("symbol"),
         "side": alert.get("side"),
@@ -582,6 +630,9 @@ class OmegaRealtimeHub:
         )
 
         self._stop_event.clear()
+
+        if BACKFILL_ENABLED:
+            await self.seed_historical_klines()
 
         self._market_task = asyncio.create_task(
             self._market_loop(),
@@ -872,6 +923,8 @@ class OmegaRealtimeHub:
         )
 
         if notifier_func is not None:
+            if str(normalized_alert.get("type", "")).lower() == "visual_state":
+                return
             try:
                 await call_maybe_async(notifier_func, normalized_alert)
             except Exception as exc:
@@ -896,6 +949,80 @@ class OmegaRealtimeHub:
 
         for key in expired:
             self._seen_alerts.pop(key, None)
+
+    async def seed_historical_klines(self) -> None:
+        logger.info(
+            "Iniciando backfill REST inicial symbols=%s timeframes=%s limit=%s",
+            len(self.symbols),
+            self.timeframes,
+            BACKFILL_LIMIT,
+        )
+
+        timeout = httpx.Timeout(12.0, connect=8.0)
+        loaded = 0
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for symbol in self.symbols:
+                for timeframe in self.timeframes:
+                    params = {
+                        "symbol": symbol,
+                        "interval": timeframe,
+                        "limit": max(80, min(BACKFILL_LIMIT, MAX_CANDLES_PER_TF)),
+                    }
+
+                    try:
+                        response = await client.get(BINANCE_FUTURES_REST_KLINES, params=params)
+                        response.raise_for_status()
+                        rows = response.json()
+                    except Exception as exc:
+                        logger.warning(
+                            "Backfill falló symbol=%s tf=%s error=%s",
+                            symbol,
+                            timeframe,
+                            exc,
+                        )
+                        continue
+
+                    if not isinstance(rows, list):
+                        continue
+
+                    candles: list[dict[str, Any]] = []
+
+                    for row in rows:
+                        if not isinstance(row, list) or len(row) < 11:
+                            continue
+
+                        candle = {
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "event_time": None,
+                            "open_time": to_int(row[0]),
+                            "close_time": to_int(row[6]),
+                            "open": to_float(row[1]),
+                            "high": to_float(row[2]),
+                            "low": to_float(row[3]),
+                            "close": to_float(row[4]),
+                            "volume": to_float(row[5]),
+                            "quote_volume": to_float(row[7]),
+                            "trades": to_int(row[8]),
+                            "taker_buy_base_volume": to_float(row[9]),
+                            "taker_buy_quote_volume": to_float(row[10]),
+                            "closed": True,
+                            "server_update_ms": now_ms(),
+                        }
+
+                        if candle["open_time"] is None:
+                            continue
+
+                        candles.append(candle)
+
+                    loaded += await self.cache.seed_klines(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        candles=candles,
+                    )
+
+        logger.info("Backfill REST inicial completado velas=%s", loaded)
 
 
 hub = OmegaRealtimeHub(WATCHLIST, TIMEFRAMES)
@@ -963,8 +1090,8 @@ async def api_watchlist() -> JSONResponse:
 
 @app.get("/api/market-state")
 async def api_market_state() -> JSONResponse:
-    snapshot = await hub.cache.snapshot()
-    return JSONResponse(snapshot)
+    state = await hub.cache.export_state()
+    return JSONResponse(state)
 
 
 @app.get("/api/scanner-payload")
@@ -991,9 +1118,9 @@ async def websocket_dashboard(websocket: WebSocket) -> None:
         await websocket.send_text(
             json_dumps(
                 {
-                    "type": "snapshot",
+                    "type": "bootstrap_state",
                     "server_time_ms": now_ms(),
-                    "data": await hub.cache.snapshot(),
+                    "data": await hub.cache.export_state(),
                 }
             )
         )
@@ -1019,12 +1146,14 @@ async def websocket_dashboard(websocket: WebSocket) -> None:
                 )
 
             elif msg_type == "get_snapshot":
+                # Compat legacy: mantener comando viejo del cliente,
+                # pero responder con el nuevo contrato semántico.
                 await websocket.send_text(
                     json_dumps(
                         {
-                            "type": "snapshot",
+                            "type": "bootstrap_state",
                             "server_time_ms": now_ms(),
-                            "data": await hub.cache.snapshot(),
+                            "data": await hub.cache.export_state(),
                         }
                     )
                 )
